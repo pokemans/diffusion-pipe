@@ -72,6 +72,28 @@
                     </tbody>
                 </table>
             </div>
+            
+            <div id="availableJobsSection">
+                <h3>Available Jobs</h3>
+                <table class="overview-table">
+                    <thead>
+                        <tr>
+                            <th>Job Name</th>
+                            <th>Status</th>
+                            <th>Step</th>
+                            <th>Loss</th>
+                            <th>ETA</th>
+                            <th>Iter Time</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="availableJobsTableBody">
+                        <tr>
+                            <td colspan="7" class="empty-state">No available jobs</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <div id="jobContent" class="hidden">
@@ -498,6 +520,46 @@
             }).join('');
         }
 
+        function renderAvailableJobsTable(jobs) {
+            const tbody = document.getElementById('availableJobsTableBody');
+            
+            if (!jobs || jobs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No available jobs</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = jobs.map(job => {
+                const statusClass = `status-badge ${job.status}`;
+                const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+                const stepDisplay = job.step_display || (job.last_step !== null ? job.last_step.toString() : '-');
+                const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
+                const eta = job.eta_seconds ? formatETA(job.eta_seconds) : 'N/A';
+                const iterTime = formatIterTime(job.avg_iter_time);
+                
+                return `
+                    <tr class="job-row" data-job="${job.job_name}">
+                        <td class="job-name-cell" onclick="viewJob('${job.job_name}')">${job.job_name}</td>
+                        <td><span class="${statusClass}">${statusText}</span></td>
+                        <td>${stepDisplay}</td>
+                        <td>${lastLoss}</td>
+                        <td>${eta}</td>
+                        <td>${iterTime}</td>
+                        <td class="action-buttons">
+                            <button class="action-btn start-btn" onclick="addJobToQueue('${job.job_name}')" title="Add to Queue">
+                                <span>➕</span>
+                            </button>
+                            <button class="action-btn copy-btn" onclick="copyJob('${job.job_name}')" title="Copy Job">
+                                <span>📋</span>
+                            </button>
+                            <button class="action-btn view-btn" onclick="viewJob('${job.job_name}')" title="View">
+                                <span>👁</span>
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
         function viewJob(jobName) {
             document.getElementById('jobSelect').value = jobName;
             document.getElementById('jobSelect').dispatchEvent(new Event('change'));
@@ -510,10 +572,12 @@
                 
                 renderRunningJobsTable(data.running_jobs || []);
                 renderQueuedJobsTable(data.queued_jobs || []);
+                renderAvailableJobsTable(data.stopped_jobs || []);
             } catch (error) {
                 console.error('Error loading jobs overview:', error);
                 document.getElementById('runningJobsTableBody').innerHTML = '<tr><td colspan="7" class="empty-state">Error loading overview</td></tr>';
                 document.getElementById('queuedJobsTableBody').innerHTML = '<tr><td colspan="8" class="empty-state">Error loading overview</td></tr>';
+                document.getElementById('availableJobsTableBody').innerHTML = '<tr><td colspan="7" class="empty-state">Error loading overview</td></tr>';
             }
         }
 
@@ -803,6 +867,58 @@
                 }
             } catch (error) {
                 alert('Error removing job: ' + error.message);
+            }
+        }
+
+        async function addJobToQueue(jobName) {
+            try {
+                const response = await fetch(`/api/jobs/${jobName}/queue/add`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    loadJobsOverview();
+                } else {
+                    const error = await response.json();
+                    alert('Error adding job to queue: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error adding job to queue: ' + error.message);
+            }
+        }
+
+        async function copyJob(jobName) {
+            const newJobName = prompt(`Enter new job name for copying '${jobName}':`);
+            
+            if (!newJobName || !newJobName.trim()) {
+                return; // User cancelled or entered empty string
+            }
+            
+            const trimmedName = newJobName.trim();
+            
+            // Basic validation
+            if (trimmedName.includes('..') || trimmedName.includes('/') || trimmedName.includes('\\')) {
+                alert('Job name cannot contain path separators');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/jobs/${jobName}/copy`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ new_job_name: trimmedName })
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    alert(`Job copied successfully to '${trimmedName}'`);
+                    loadJobsOverview();
+                } else {
+                    const error = await response.json();
+                    alert('Error copying job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error copying job: ' + error.message);
             }
         }
 

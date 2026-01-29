@@ -580,6 +580,15 @@ button {
     background-color: #d6d8db;
 }
 
+.copy-btn {
+    background-color: #cfe2ff;
+    color: #084298;
+}
+
+.copy-btn:hover:not(:disabled) {
+    background-color: #b6d4fe;
+}
+
 /* Queue Position */
 .queue-position {
     font-weight: 600;
