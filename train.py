@@ -782,11 +782,29 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
+    print(f'oooooooooooooooooooooo steps_per_epoch: ', steps_per_epoch)
+
+
     scheduler_type = config.get('lr_scheduler', 'constant')
     if scheduler_type == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     elif scheduler_type == 'linear':
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
+    elif scheduler_type == 'cosine':
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config['epochs'] * steps_per_epoch,
+            eta_min=config.get('lr_scheduler_eta_min', 0)
+        )
+    elif scheduler_type == 'cosine_with_restarts':
+        # T_0 is the number of steps until the first restart
+        # T_mult is the factor by which T_0 increases after each restart (default 1 = fixed period)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=config.get('lr_scheduler_t0', steps_per_epoch),
+            T_mult=config.get('lr_scheduler_t_mult', 1),
+            eta_min=config.get('lr_scheduler_eta_min', 0)
+        )
     else:
         raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
     if config['warmup_steps'] > 0:
