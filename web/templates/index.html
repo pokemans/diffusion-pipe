@@ -679,7 +679,8 @@
 
         function applyPlotSettings() {
             // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:653',message:'applyPlotSettings entry',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,minStep:plotSettings.minStep,maxStep:plotSettings.maxStep,movingAverage:plotSettings.movingAverage,windowSize:plotSettings.windowSize},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+            const stackTrace = new Error().stack;
+            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:680',message:'applyPlotSettings entry',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,minStep:plotSettings.minStep,maxStep:plotSettings.maxStep,movingAverage:plotSettings.movingAverage,windowSize:plotSettings.windowSize,stackTrace:stackTrace?.split('\n').slice(0,5).join(' | ')},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'E'})}).catch(()=>{});
             // #endregion
 
             // Start with raw data
@@ -718,7 +719,8 @@
 
         function updatePlot() {
             // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:675',message:'updatePlot entry',data:{stepsLength:lossData.steps.length,lossesLength:lossData.losses.length,rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,showRaw:plotSettings.showRaw,movingAverage:plotSettings.movingAverage},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+            const stackTrace = new Error().stack;
+            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:719',message:'updatePlot entry',data:{stepsLength:lossData.steps.length,lossesLength:lossData.losses.length,rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,showRaw:plotSettings.showRaw,movingAverage:plotSettings.movingAverage,stackTrace:stackTrace?.split('\n').slice(0,5).join(' | ')},timestamp:Date.now(),sessionId:'debug-session',runId:'run2',hypothesisId:'E'})}).catch(()=>{});
             // #endregion
 
             const traces = [];
