@@ -868,11 +868,6 @@ if __name__ == '__main__':
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         loss = model_engine.train_batch(iterator).item()
-        
-        # Step the learning rate scheduler after optimizer step
-        if model_engine.lr_scheduler is not None:
-            model_engine.lr_scheduler.step()
-        
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
