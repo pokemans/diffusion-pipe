@@ -28,6 +28,10 @@ job_metadata = defaultdict(dict)
 MAX_LOG_LINES = 10000
 PRUNE_THRESHOLD_MULTIPLIER = 1.2
 
+# Iter time smoothing constants
+ITER_TIME_WINDOW_SIZE = 30  # Number of iter times to keep for moving average
+ITER_TIME_MIN_SAMPLES = 5  # Minimum samples before calculating average
+
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.parent
 JOBS_DIR = PROJECT_ROOT / 'jobs'
@@ -53,6 +57,39 @@ def prune_logs(job_name):
     threshold = int(MAX_LOG_LINES * PRUNE_THRESHOLD_MULTIPLIER)
     if len(logs_list) > threshold:
         job_logs[job_name] = logs_list[-MAX_LOG_LINES:]
+
+
+def calculate_smoothed_iter_time(iter_times):
+    """
+    Calculate smoothed iter time using exponential moving average.
+    Gives more weight to recent values for better responsiveness while smoothing out noise.
+    """
+    if not iter_times:
+        return 0.0
+    
+    if len(iter_times) == 1:
+        return iter_times[0]
+    
+    # Use exponential moving average (EMA) for smoothing
+    # Alpha controls the smoothing factor (0 < alpha <= 1)
+    # Lower alpha = more smoothing, higher alpha = more responsive
+    # Use adaptive alpha based on sample count for better initial stability
+    sample_count = len(iter_times)
+    if sample_count < 10:
+        # More smoothing for fewer samples
+        alpha = 0.3
+    elif sample_count < 20:
+        alpha = 0.4
+    else:
+        # More responsive for many samples
+        alpha = 0.5
+    
+    # Calculate EMA: EMA = alpha * current + (1 - alpha) * previous_EMA
+    ema = iter_times[0]
+    for iter_time in iter_times[1:]:
+        ema = alpha * iter_time + (1 - alpha) * ema
+    
+    return ema
 
 
 def parse_log_line(line, job_name):
@@ -85,8 +122,8 @@ def parse_log_line(line, job_name):
                     if 'iter_times' not in metadata:
                         metadata['iter_times'] = []
                     metadata['iter_times'].append(iter_time)
-                    # Keep last 10 iter times for averaging
-                    if len(metadata['iter_times']) > 10:
+                    # Keep last N iter times for moving average smoothing
+                    if len(metadata['iter_times']) > ITER_TIME_WINDOW_SIZE:
                         metadata['iter_times'].pop(0)
         
         metadata['last_step'] = step
@@ -95,9 +132,9 @@ def parse_log_line(line, job_name):
         # Calculate total_steps and ETA if we have the necessary data
         if 'total_steps' in metadata:
             result['total_steps'] = metadata['total_steps']
-            # Calculate ETA
-            if 'iter_times' in metadata and len(metadata['iter_times']) > 0:
-                avg_iter_time = sum(metadata['iter_times']) / len(metadata['iter_times'])
+            # Calculate ETA using smoothed moving average
+            if 'iter_times' in metadata and len(metadata['iter_times']) >= ITER_TIME_MIN_SAMPLES:
+                avg_iter_time = calculate_smoothed_iter_time(metadata['iter_times'])
                 steps_per_iter = metadata.get('gradient_accumulation_steps', 1)
                 remaining_steps = metadata['total_steps'] - step
                 if remaining_steps > 0 and steps_per_iter > 0:
@@ -142,9 +179,9 @@ def parse_log_line(line, job_name):
                 job_metadata[job_name] = {}
             if 'iter_times' not in job_metadata[job_name]:
                 job_metadata[job_name]['iter_times'] = []
-            # Keep last 10 iter times for averaging
+            # Keep last N iter times for moving average smoothing
             job_metadata[job_name]['iter_times'].append(iter_time)
-            if len(job_metadata[job_name]['iter_times']) > 10:
+            if len(job_metadata[job_name]['iter_times']) > ITER_TIME_WINDOW_SIZE:
                 job_metadata[job_name]['iter_times'].pop(0)
             break
     
@@ -335,8 +372,8 @@ def get_job_status(job_name):
         # Calculate ETA if not present
         if 'eta_seconds' not in stat and 'step' in stat:
             step = stat['step']
-            if total_steps and 'iter_times' in metadata and len(metadata['iter_times']) > 0:
-                avg_iter_time = sum(metadata['iter_times']) / len(metadata['iter_times'])
+            if total_steps and 'iter_times' in metadata and len(metadata['iter_times']) >= ITER_TIME_MIN_SAMPLES:
+                avg_iter_time = calculate_smoothed_iter_time(metadata['iter_times'])
                 steps_per_iter = metadata.get('gradient_accumulation_steps', 1)
                 remaining_steps = total_steps - step
                 if remaining_steps > 0 and steps_per_iter > 0:
