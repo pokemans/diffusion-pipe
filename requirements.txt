@@ -31,3 +31,5 @@ ninja
 flask
 flask-socketio
 python-socketio
+nvidia-ml-py
+psutil
