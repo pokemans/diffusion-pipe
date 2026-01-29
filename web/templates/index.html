@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Training Job Manager</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
@@ -114,7 +115,7 @@
                                 </label>
                             </div>
                         </div>
-                        <div id="lossPlot" class="plot"></div>
+                        <canvas id="lossPlot" class="plot"></canvas>
                     </div>
                 </div>
             </div>
@@ -138,6 +139,7 @@
             showRaw: false
         };
         let overviewRefreshInterval = null;
+        let lossChart = null;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -145,7 +147,71 @@
             loadJobsOverview();
             setupEventListeners();
             startOverviewRefresh();
+            initializeChart();
         });
+
+        function initializeChart() {
+            const ctx = document.getElementById('lossPlot');
+            if (!ctx) return;
+
+            lossChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: []
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top'
+                        },
+                        title: {
+                            display: true,
+                            text: 'Training Loss'
+                        },
+                        tooltip: {
+                            enabled: true
+                        },
+                        zoom: {
+                            zoom: {
+                                wheel: {
+                                    enabled: true
+                                },
+                                pinch: {
+                                    enabled: true
+                                },
+                                mode: 'xy'
+                            },
+                            pan: {
+                                enabled: true,
+                                mode: 'xy'
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Steps'
+                            },
+                            type: 'linear'
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Loss'
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         function setupEventListeners() {
             // Job selector
@@ -244,10 +310,12 @@
             });
 
             document.getElementById('resetZoomBtn').addEventListener('click', () => {
-                Plotly.relayout('lossPlot', {
-                    'xaxis.autorange': true,
-                    'yaxis.autorange': true
-                });
+                if (lossChart && lossChart.resetZoom) {
+                    lossChart.resetZoom();
+                } else if (lossChart) {
+                    // Manual reset if zoom plugin not available
+                    lossChart.reset();
+                }
             });
 
             document.getElementById('showRawToggle').addEventListener('change', (e) => {
@@ -725,40 +793,38 @@
         }
 
         function updatePlot() {
-            // #region agent log
-            const stackTrace = new Error().stack;
-            const plotElement = document.getElementById('lossPlot');
-            const hasExistingPlot = plotElement && typeof Plotly !== 'undefined' && plotElement.data && plotElement.data.length > 0;
-            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:727',message:'updatePlot entry',data:{stepsLength:lossData.steps.length,lossesLength:lossData.losses.length,rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,showRaw:plotSettings.showRaw,movingAverage:plotSettings.movingAverage,hasExistingPlot:hasExistingPlot,stackTrace:stackTrace?.split('\n').slice(0,5).join(' | ')},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix3',hypothesisId:'G'})}).catch(()=>{});
-            // #endregion
-
-            // Early return if no data at all - prevents clearing plot unnecessarily
-            // Always return early if no data - this preserves any existing plot
-            if (lossData.rawSteps.length === 0 && lossData.steps.length === 0) {
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:737',message:'updatePlot early return - no data',data:{rawStepsLength:lossData.rawSteps.length,stepsLength:lossData.steps.length,hasExistingPlot:hasExistingPlot},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix3',hypothesisId:'F'})}).catch(()=>{});
-                // #endregion
-                // Always return early if no data - this prevents clearing an existing plot
-                // The plot will be updated when new data arrives via WebSocket or updateJobStatus
+            if (!lossChart) {
                 return;
             }
 
-            const traces = [];
+            // Early return if no data at all - prevents clearing plot unnecessarily
+            if (lossData.rawSteps.length === 0 && lossData.steps.length === 0) {
+                return;
+            }
+
+            const datasets = [];
             
-            // Add smoothed/filtered trace
+            // Add smoothed/filtered dataset
             if (lossData.steps.length > 0) {
-                traces.push({
-                    x: lossData.steps,
-                    y: lossData.losses,
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    name: plotSettings.movingAverage ? 'Smoothed Loss' : 'Loss',
-                    line: { color: '#007bff', width: 2 },
-                    marker: { size: 4 }
+                const dataPoints = lossData.steps.map((step, idx) => ({
+                    x: step,
+                    y: lossData.losses[idx]
+                }));
+                
+                datasets.push({
+                    label: plotSettings.movingAverage ? 'Smoothed Loss' : 'Loss',
+                    data: dataPoints,
+                    borderColor: '#007bff',
+                    backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                    borderWidth: 2,
+                    pointRadius: 2,
+                    pointHoverRadius: 4,
+                    fill: false,
+                    tension: 0.1
                 });
             }
             
-            // Add raw trace if enabled and moving average is on
+            // Add raw dataset if enabled and moving average is on
             if (plotSettings.showRaw && plotSettings.movingAverage && lossData.rawSteps.length > 0) {
                 let rawSteps = [...lossData.rawSteps];
                 let rawLosses = [...lossData.rawLosses];
@@ -770,49 +836,41 @@
                     rawLosses = filtered.losses;
                 }
                 
-                traces.push({
-                    x: rawSteps,
-                    y: rawLosses,
-                    type: 'scatter',
-                    mode: 'lines+markers',
-                    name: 'Raw Loss',
-                    line: { color: '#cccccc', width: 1 },
-                    marker: { size: 2, opacity: 0.5 }
-                });
+                if (rawSteps.length > 0) {
+                    const rawDataPoints = rawSteps.map((step, idx) => ({
+                        x: step,
+                        y: rawLosses[idx]
+                    }));
+                    
+                    datasets.push({
+                        label: 'Raw Loss',
+                        data: rawDataPoints,
+                        borderColor: '#cccccc',
+                        backgroundColor: 'rgba(204, 204, 204, 0.1)',
+                        borderWidth: 1,
+                        pointRadius: 1,
+                        pointHoverRadius: 3,
+                        fill: false,
+                        tension: 0.1,
+                        pointBackgroundColor: 'rgba(204, 204, 204, 0.5)',
+                        pointBorderColor: 'rgba(204, 204, 204, 0.5)'
+                    });
+                }
             }
-            
-            // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:750',message:'before Plotly.react',data:{tracesLength:traces.length,hasMainTrace:lossData.steps.length>0,hasRawTrace:plotSettings.showRaw&&plotSettings.movingAverage&&lossData.rawSteps.length>0},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'C'})}).catch(()=>{});
-            // #endregion
 
-            // Don't update plot if there are no traces - this prevents clearing an existing plot
-            if (traces.length === 0) {
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:754',message:'skipping Plotly.react - no traces after processing',data:{tracesLength:traces.length,rawStepsLength:lossData.rawSteps.length,stepsLength:lossData.steps.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'C'})}).catch(()=>{});
-                // #endregion
+            // Don't update plot if there are no datasets - this prevents clearing an existing plot
+            if (datasets.length === 0) {
                 return;
             }
 
-            const layout = {
-                title: 'Training Loss',
-                xaxis: { title: 'Steps' },
-                yaxis: { title: 'Loss' },
-                margin: { l: 60, r: 20, t: 40, b: 60 },
-                showlegend: traces.length > 1,
-                hovermode: 'closest'
-            };
-
-            try {
-                Plotly.react('lossPlot', traces, layout, { responsive: true });
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:728',message:'Plotly.react success',data:{tracesLength:traces.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'C'})}).catch(()=>{});
-                // #endregion
-            } catch (error) {
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:731',message:'Plotly.react error',data:{error:error.message,tracesLength:traces.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'C'})}).catch(()=>{});
-                // #endregion
-                console.error('Plotly.react error:', error);
-            }
+            // Update chart data
+            lossChart.data.datasets = datasets;
+            
+            // Update legend visibility
+            lossChart.options.plugins.legend.display = datasets.length > 1;
+            
+            // Update chart
+            lossChart.update('none'); // 'none' mode for better performance with real-time updates
         }
 
         // Poll for status updates
