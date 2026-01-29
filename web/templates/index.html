@@ -727,14 +727,19 @@
         function updatePlot() {
             // #region agent log
             const stackTrace = new Error().stack;
-            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:719',message:'updatePlot entry',data:{stepsLength:lossData.steps.length,lossesLength:lossData.losses.length,rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,showRaw:plotSettings.showRaw,movingAverage:plotSettings.movingAverage,stackTrace:stackTrace?.split('\n').slice(0,5).join(' | ')},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'E'})}).catch(()=>{});
+            const plotElement = document.getElementById('lossPlot');
+            const hasExistingPlot = plotElement && typeof Plotly !== 'undefined' && plotElement.data && plotElement.data.length > 0;
+            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:727',message:'updatePlot entry',data:{stepsLength:lossData.steps.length,lossesLength:lossData.losses.length,rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,showRaw:plotSettings.showRaw,movingAverage:plotSettings.movingAverage,hasExistingPlot:hasExistingPlot,stackTrace:stackTrace?.split('\n').slice(0,5).join(' | ')},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix3',hypothesisId:'G'})}).catch(()=>{});
             // #endregion
 
             // Early return if no data at all - prevents clearing plot unnecessarily
+            // Always return early if no data - this preserves any existing plot
             if (lossData.rawSteps.length === 0 && lossData.steps.length === 0) {
                 // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:724',message:'updatePlot early return - no data',data:{rawStepsLength:lossData.rawSteps.length,stepsLength:lossData.steps.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'F'})}).catch(()=>{});
+                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:737',message:'updatePlot early return - no data',data:{rawStepsLength:lossData.rawSteps.length,stepsLength:lossData.steps.length,hasExistingPlot:hasExistingPlot},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix3',hypothesisId:'F'})}).catch(()=>{});
                 // #endregion
+                // Always return early if no data - this prevents clearing an existing plot
+                // The plot will be updated when new data arrives via WebSocket or updateJobStatus
                 return;
             }
 
