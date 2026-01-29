@@ -1602,6 +1602,9 @@ use_venv = ${launchConfig.use_venv}
                 const gpu = data.gpu;
                 stats.push(`<span class="stat-item"><span class="stat-icon">🖥️</span><span class="stat-value">${gpu.utilization}%</span></span>`);
                 stats.push(`<span class="stat-item"><span class="stat-icon">🌡️</span><span class="stat-value">${gpu.temperature}°C</span></span>`);
+                if (gpu.power_watts !== null && gpu.power_watts !== undefined) {
+                    stats.push(`<span class="stat-item"><span class="stat-icon">⚡</span><span class="stat-value">${gpu.power_watts}W</span></span>`);
+                }
                 stats.push(`<span class="stat-item"><span class="stat-icon">🏃</span><span class="stat-value">${gpu.memory_used_gb}/${gpu.memory_total_gb} GB</span></span>`);
             }
 
