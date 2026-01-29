@@ -696,6 +696,107 @@ def get_job_status(job_name):
     return jsonify(status)
 
 
+def parse_launch_config(config):
+    """Parse launch configuration from job config, returning dict with defaults."""
+    launch_config = config.get('launch', {})
+    
+    # Default values
+    defaults = {
+        'env_vars': ['NCCL_P2P_DISABLE=1', 'NCCL_IB_DISABLE=1'],
+        'deepspeed_args': '--num_gpus=1',
+        'python_args': '--deepspeed',
+        'use_venv': True
+    }
+    
+    result = defaults.copy()
+    
+    # Override with config values if present
+    if 'env_vars' in launch_config:
+        env_vars = launch_config['env_vars']
+        if isinstance(env_vars, list):
+            # Validate format
+            validated = []
+            for env_var in env_vars:
+                if isinstance(env_var, str) and '=' in env_var:
+                    validated.append(env_var)
+            result['env_vars'] = validated
+        elif isinstance(env_vars, str):
+            # Handle string format (comma-separated or newline-separated)
+            if ',' in env_vars:
+                result['env_vars'] = [v.strip() for v in env_vars.split(',') if '=' in v.strip()]
+            else:
+                result['env_vars'] = [v.strip() for v in env_vars.split('\n') if v.strip() and '=' in v.strip()]
+    
+    if 'deepspeed_args' in launch_config:
+        result['deepspeed_args'] = str(launch_config['deepspeed_args']).strip()
+    
+    if 'python_args' in launch_config:
+        python_args = str(launch_config['python_args']).strip()
+        # Remove --config if present (we always add it)
+        python_args = python_args.replace('--config', '').strip()
+        result['python_args'] = python_args
+    
+    if 'use_venv' in launch_config:
+        result['use_venv'] = bool(launch_config['use_venv'])
+    
+    return result
+
+
+def build_launch_command(job_name, config, config_path):
+    """Build launch command string from config."""
+    launch_config = parse_launch_config(config)
+    
+    # Check for venv
+    venv_activate = None
+    if launch_config['use_venv']:
+        venv_paths = [
+            PROJECT_ROOT / 'venv' / 'bin' / 'activate',
+            PROJECT_ROOT / '.venv' / 'bin' / 'activate',
+        ]
+        for path in venv_paths:
+            if path.exists():
+                venv_activate = path
+                break
+    
+    # Build command parts
+    cmd_parts = []
+    
+    # Venv activation (if enabled and found)
+    if venv_activate:
+        cmd_parts.append(f'source {venv_activate}')
+    
+    # Environment variables
+    env_vars_str = ' '.join(launch_config['env_vars']) if launch_config['env_vars'] else ''
+    
+    # DeepSpeed command with arguments
+    deepspeed_cmd = f"deepspeed {launch_config['deepspeed_args']}"
+    
+    # Python script and arguments
+    python_args = launch_config['python_args']
+    python_cmd = f"train.py {python_args} --config {config_path}"
+    
+    # Combine all parts
+    # If venv is used, join with &&, otherwise just spaces
+    if venv_activate:
+        # Venv activation needs && separator
+        main_cmd_parts = []
+        if env_vars_str:
+            main_cmd_parts.append(env_vars_str)
+        main_cmd_parts.append(deepspeed_cmd)
+        main_cmd_parts.append(python_cmd)
+        main_cmd = ' '.join(main_cmd_parts)
+        cmd_str = f"{cmd_parts[0]} && {main_cmd}"
+    else:
+        # No venv, just join everything with spaces
+        if env_vars_str:
+            cmd_parts.append(env_vars_str)
+        cmd_parts.append(deepspeed_cmd)
+        cmd_parts.append(python_cmd)
+        cmd_str = ' '.join(cmd_parts)
+    
+    return cmd_str
+
+
 def _launch_job_internal(job_name):
     """Internal function to launch a job (used by launch endpoint and queue system)."""
     # Check if config files exist
@@ -711,7 +812,8 @@ def _launch_job_internal(job_name):
         job_metadata[job_name].pop('last_step', None)
         job_metadata[job_name].pop('last_step_time', None)
     
-    # Read job config to extract epochs and gradient_accumulation_steps
+    # Read job config
+    config = None
     try:
         with open(job_config, 'r') as f:
             config = toml.load(f)
@@ -724,29 +826,17 @@ def _launch_job_internal(job_name):
             # Calculate total_steps if we already have steps_per_epoch
             if 'steps_per_epoch' in job_metadata[job_name] and 'epochs' in job_metadata[job_name]:
                 job_metadata[job_name]['total_steps'] = job_metadata[job_name]['steps_per_epoch'] * job_metadata[job_name]['epochs']
-    except Exception:
-        pass
+    except Exception as e:
+        return None, f'Error reading config: {str(e)}'
+    
+    if config is None:
+        return None, 'Failed to load config'
     
     try:
-        # Construct command - check for venv in common locations
-        venv_paths = [
-            PROJECT_ROOT / 'venv' / 'bin' / 'activate',
-            PROJECT_ROOT / '.venv' / 'bin' / 'activate',
-        ]
-        
-        venv_activate = None
-        for path in venv_paths:
-            if path.exists():
-                venv_activate = path
-                break
-        
         config_path = job_config.absolute()
         
-        # Build command string
-        if venv_activate:
-            cmd_str = f'source {venv_activate} && NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 deepspeed --num_gpus=1 train.py --deepspeed --config {config_path}'
-        else:
-            cmd_str = f'NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 deepspeed --num_gpus=1 train.py --deepspeed --config {config_path}'
+        # Build command using config
+        cmd_str = build_launch_command(job_name, config, config_path)
         
         # Launch process with new process group so we can kill all children
         def preexec_fn():

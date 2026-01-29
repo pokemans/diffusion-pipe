@@ -94,12 +94,13 @@
 
         <div id="jobContent" class="hidden">
             <div class="tabs">
-                <button class="tab-btn active" data-tab="config">Job Config</button>
+                <button class="tab-btn" data-tab="config">Job Config</button>
                 <button class="tab-btn" data-tab="dataset">Dataset Config</button>
-                <button class="tab-btn" data-tab="monitor">Monitor</button>
+                <button class="tab-btn" data-tab="launch">Launch Options</button>
+                <button class="tab-btn active" data-tab="monitor">Monitor</button>
             </div>
 
-            <div class="tab-content active" id="configTab">
+            <div class="tab-content" id="configTab">
                 <div class="editor-container">
                     <div class="editor-header">
                         <h3>Job Config (job_config.toml)</h3>
@@ -119,7 +120,36 @@
                 </div>
             </div>
 
-            <div class="tab-content" id="monitorTab">
+            <div class="tab-content" id="launchTab">
+                <div class="launch-options-container">
+                    <div class="editor-header">
+                        <h3>Launch Options</h3>
+                        <button id="saveLaunchOptionsBtn" class="save-btn">Save</button>
+                    </div>
+                    <div class="launch-form">
+                        <div class="form-group">
+                            <label for="envVarsInput">Environment Variables (one per line, format: KEY=VALUE):</label>
+                            <textarea id="envVarsInput" class="form-textarea" rows="4" placeholder="NCCL_P2P_DISABLE=1&#10;NCCL_IB_DISABLE=1"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="deepspeedArgsInput">DeepSpeed Arguments:</label>
+                            <input type="text" id="deepspeedArgsInput" class="form-input" placeholder="--num_gpus=1" value="--num_gpus=1">
+                        </div>
+                        <div class="form-group">
+                            <label for="pythonArgsInput">Python Arguments:</label>
+                            <input type="text" id="pythonArgsInput" class="form-input" placeholder="--deepspeed" value="--deepspeed">
+                        </div>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="useVenvInput" checked>
+                                Use Virtual Environment (auto-detected)
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="tab-content active" id="monitorTab">
                 <div class="controls">
                     <button id="launchBtn" class="launch-btn">Launch Job</button>
                     <button id="stopBtn" class="stop-btn hidden">Stop Job</button>
@@ -298,6 +328,10 @@
 
             document.getElementById('saveDatasetConfigBtn').addEventListener('click', () => {
                 saveDatasetConfig();
+            });
+
+            document.getElementById('saveLaunchOptionsBtn').addEventListener('click', () => {
+                saveLaunchOptions();
             });
 
             // Launch/Stop buttons
@@ -618,6 +652,8 @@
                 if (configRes.ok) {
                     const configData = await configRes.json();
                     document.getElementById('jobConfigEditor').value = configData.content;
+                    // Populate launch options form
+                    populateLaunchOptions(configData.content);
                 }
 
                 if (datasetRes.ok) {
@@ -700,6 +736,262 @@
                 }
             } catch (error) {
                 alert('Error saving config: ' + error.message);
+            }
+        }
+
+        function parseLaunchConfig(configContent) {
+            try {
+                // Simple TOML parsing for [launch] section
+                const lines = configContent.split('\n');
+                let inLaunchSection = false;
+                let launchLines = [];
+                let bracketDepth = 0;
+                
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const trimmed = line.trim();
+                    
+                    if (trimmed === '[launch]') {
+                        inLaunchSection = true;
+                        continue;
+                    }
+                    
+                    if (inLaunchSection) {
+                        // Check if we've hit another section
+                        if (trimmed.startsWith('[') && trimmed.endsWith(']') && trimmed !== '[launch]') {
+                            break;
+                        }
+                        
+                        // Count brackets for array parsing
+                        bracketDepth += (line.match(/\[/g) || []).length;
+                        bracketDepth -= (line.match(/\]/g) || []).length;
+                        
+                        launchLines.push(line);
+                        
+                        // If we've closed all brackets and we're past the first line, we might be done
+                        if (bracketDepth === 0 && launchLines.length > 1 && trimmed && !trimmed.includes('=')) {
+                            // Might be done, but check if next line is empty or starts a new section
+                            if (i + 1 < lines.length) {
+                                const nextTrimmed = lines[i + 1].trim();
+                                if (nextTrimmed === '' || (nextTrimmed.startsWith('[') && nextTrimmed.endsWith(']'))) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (launchLines.length === 0) {
+                    return null;
+                }
+                
+                // Parse the launch section
+                const launchSection = launchLines.join('\n');
+                const config = {};
+                
+                // Parse env_vars array - handle multi-line arrays
+                const envVarsMatch = launchSection.match(/env_vars\s*=\s*\[([\s\S]*?)\]/);
+                if (envVarsMatch) {
+                    const envVarsContent = envVarsMatch[1];
+                    // Split by comma, but handle quoted strings that might contain commas
+                    const envVars = [];
+                    let current = '';
+                    let inQuotes = false;
+                    let quoteChar = null;
+                    
+                    for (let char of envVarsContent) {
+                        if ((char === '"' || char === "'") && !inQuotes) {
+                            inQuotes = true;
+                            quoteChar = char;
+                        } else if (char === quoteChar && inQuotes) {
+                            inQuotes = false;
+                            quoteChar = null;
+                        } else if (char === ',' && !inQuotes) {
+                            const trimmed = current.trim().replace(/^["']|["']$/g, '');
+                            if (trimmed) envVars.push(trimmed);
+                            current = '';
+                            continue;
+                        }
+                        current += char;
+                    }
+                    if (current.trim()) {
+                        const trimmed = current.trim().replace(/^["']|["']$/g, '');
+                        if (trimmed) envVars.push(trimmed);
+                    }
+                    
+                    if (envVars.length > 0) {
+                        config.env_vars = envVars;
+                    }
+                }
+                
+                // Parse deepspeed_args - handle both quoted and unquoted
+                const deepspeedMatch = launchSection.match(/deepspeed_args\s*=\s*(?:["']([^"']+)["']|([^\n]+))/);
+                if (deepspeedMatch) {
+                    config.deepspeed_args = (deepspeedMatch[1] || deepspeedMatch[2]).trim();
+                }
+                
+                // Parse python_args - handle both quoted and unquoted
+                const pythonMatch = launchSection.match(/python_args\s*=\s*(?:["']([^"']+)["']|([^\n]+))/);
+                if (pythonMatch) {
+                    config.python_args = (pythonMatch[1] || pythonMatch[2]).trim();
+                }
+                
+                // Parse use_venv
+                const venvMatch = launchSection.match(/use_venv\s*=\s*(true|false)/i);
+                if (venvMatch) {
+                    config.use_venv = venvMatch[1].toLowerCase() === 'true';
+                }
+                
+                return Object.keys(config).length > 0 ? config : null;
+            } catch (error) {
+                console.error('Error parsing launch config:', error);
+                return null;
+            }
+        }
+
+        function populateLaunchOptions(configContent) {
+            const launchConfig = parseLaunchConfig(configContent);
+            
+            if (launchConfig) {
+                // Populate environment variables
+                if (launchConfig.env_vars && Array.isArray(launchConfig.env_vars)) {
+                    document.getElementById('envVarsInput').value = launchConfig.env_vars.join('\n');
+                } else {
+                    document.getElementById('envVarsInput').value = 'NCCL_P2P_DISABLE=1\nNCCL_IB_DISABLE=1';
+                }
+                
+                // Populate deepspeed args
+                if (launchConfig.deepspeed_args) {
+                    document.getElementById('deepspeedArgsInput').value = launchConfig.deepspeed_args;
+                } else {
+                    document.getElementById('deepspeedArgsInput').value = '--num_gpus=1';
+                }
+                
+                // Populate python args
+                if (launchConfig.python_args) {
+                    document.getElementById('pythonArgsInput').value = launchConfig.python_args;
+                } else {
+                    document.getElementById('pythonArgsInput').value = '--deepspeed';
+                }
+                
+                // Populate use_venv checkbox
+                if (launchConfig.use_venv !== undefined) {
+                    document.getElementById('useVenvInput').checked = launchConfig.use_venv;
+                } else {
+                    document.getElementById('useVenvInput').checked = true;
+                }
+            } else {
+                // Use defaults
+                document.getElementById('envVarsInput').value = 'NCCL_P2P_DISABLE=1\nNCCL_IB_DISABLE=1';
+                document.getElementById('deepspeedArgsInput').value = '--num_gpus=1';
+                document.getElementById('pythonArgsInput').value = '--deepspeed';
+                document.getElementById('useVenvInput').checked = true;
+            }
+        }
+
+        function updateLaunchSectionInToml(tomlContent, launchConfig) {
+            // Check if [launch] section exists
+            const launchSectionRegex = /\[launch\][\s\S]*?(?=\n\[|\n*$)/;
+            const hasLaunchSection = launchSectionRegex.test(tomlContent);
+            
+            // Build launch section TOML
+            const envVarsArray = launchConfig.env_vars
+                .filter(v => v.trim())
+                .map(v => {
+                    const trimmed = v.trim();
+                    // Escape quotes if present
+                    if (trimmed.includes('"')) {
+                        return `'${trimmed}'`;
+                    }
+                    return `"${trimmed}"`;
+                })
+                .join(', ');
+            
+            // Escape quotes in strings
+            const escapeQuotes = (str) => str.replace(/"/g, '\\"');
+            
+            const launchSection = `[launch]
+env_vars = [${envVarsArray}]
+deepspeed_args = "${escapeQuotes(launchConfig.deepspeed_args)}"
+python_args = "${escapeQuotes(launchConfig.python_args)}"
+use_venv = ${launchConfig.use_venv}
+`;
+            
+            if (hasLaunchSection) {
+                // Replace existing section
+                return tomlContent.replace(launchSectionRegex, launchSection.trim());
+            } else {
+                // Append at the end
+                return tomlContent.trim() + '\n\n' + launchSection;
+            }
+        }
+
+        async function saveLaunchOptions() {
+            if (!currentJob) return;
+
+            // Get form values
+            const envVarsText = document.getElementById('envVarsInput').value;
+            const envVars = envVarsText
+                .split('\n')
+                .map(v => v.trim())
+                .filter(v => v && v.includes('='));
+            
+            const deepspeedArgs = document.getElementById('deepspeedArgsInput').value.trim();
+            const pythonArgs = document.getElementById('pythonArgsInput').value.trim();
+            const useVenv = document.getElementById('useVenvInput').checked;
+            
+            // Validate
+            if (!deepspeedArgs) {
+                alert('DeepSpeed arguments cannot be empty');
+                return;
+            }
+            
+            if (!pythonArgs) {
+                alert('Python arguments cannot be empty');
+                return;
+            }
+            
+            try {
+                // Get current config
+                const configResponse = await fetch(`/api/jobs/${currentJob}/config`);
+                if (!configResponse.ok) {
+                    throw new Error('Failed to load current config');
+                }
+                
+                const configData = await configResponse.json();
+                const currentConfig = configData.content;
+                
+                // Update launch section
+                const launchConfig = {
+                    env_vars: envVars.length > 0 ? envVars : ['NCCL_P2P_DISABLE=1', 'NCCL_IB_DISABLE=1'],
+                    deepspeed_args: deepspeedArgs,
+                    python_args: pythonArgs,
+                    use_venv: useVenv
+                };
+                
+                const updatedConfig = updateLaunchSectionInToml(currentConfig, launchConfig);
+                
+                // Save updated config
+                const saveResponse = await fetch(`/api/jobs/${currentJob}/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: updatedConfig })
+                });
+
+                if (saveResponse.ok) {
+                    alert('Launch options saved successfully');
+                    // Reload config editor to show updated content
+                    const reloadResponse = await fetch(`/api/jobs/${currentJob}/config`);
+                    if (reloadResponse.ok) {
+                        const reloadData = await reloadResponse.json();
+                        document.getElementById('jobConfigEditor').value = reloadData.content;
+                    }
+                } else {
+                    const error = await saveResponse.json();
+                    alert('Error saving launch options: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error saving launch options: ' + error.message);
             }
         }
 
