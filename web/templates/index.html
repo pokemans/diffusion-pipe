@@ -12,12 +12,8 @@
 <body>
     <div class="container">
         <header>
-            <h1 id="headerTitle">Training Job Manager</h1>
-            <div class="job-selector">
-                <label for="jobSelect">Job:</label>
-                <select id="jobSelect">
-                    <option value="">Select a job...</option>
-                </select>
+            <div class="header-top">
+                <h1 id="headerTitle">Training Job Manager</h1>
                 <button id="createJobBtn">Create New Job</button>
             </div>
             <div id="systemStats" class="system-stats">
@@ -275,21 +271,8 @@
         function setupEventListeners() {
             // Header title click - navigate to overview
             document.getElementById('headerTitle').addEventListener('click', () => {
-                document.getElementById('jobSelect').value = '';
                 hideJobContent();
                 showOverview();
-            });
-
-            // Job selector
-            document.getElementById('jobSelect').addEventListener('change', (e) => {
-                const jobName = e.target.value;
-                if (jobName) {
-                    loadJob(jobName);
-                    hideOverview();
-                } else {
-                    hideJobContent();
-                    showOverview();
-                }
             });
 
             // Create job button
@@ -391,20 +374,8 @@
         }
 
         async function loadJobs() {
-            try {
-                const response = await fetch('/api/jobs');
-                const data = await response.json();
-                const select = document.getElementById('jobSelect');
-                select.innerHTML = '<option value="">Select a job...</option>';
-                data.jobs.forEach(job => {
-                    const option = document.createElement('option');
-                    option.value = job;
-                    option.textContent = job;
-                    select.appendChild(option);
-                });
-            } catch (error) {
-                console.error('Error loading jobs:', error);
-            }
+            // Jobs are now loaded via loadJobsOverview() which shows them in tables
+            // This function kept for potential future use but doesn't need to do anything
         }
 
         function formatETA(seconds) {
@@ -561,8 +532,8 @@
         }
 
         function viewJob(jobName) {
-            document.getElementById('jobSelect').value = jobName;
-            document.getElementById('jobSelect').dispatchEvent(new Event('change'));
+            loadJob(jobName);
+            hideOverview();
         }
 
         async function loadJobsOverview() {
@@ -624,9 +595,7 @@
                     body: JSON.stringify({ content: '# Dataset configuration\n' })
                 });
 
-                await loadJobs();
                 await loadJobsOverview();
-                document.getElementById('jobSelect').value = jobName;
                 loadJob(jobName);
             } catch (error) {
                 console.error('Error creating job:', error);
