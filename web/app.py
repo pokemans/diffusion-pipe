@@ -3,9 +3,10 @@ import re
 import json
 import subprocess
 import threading
+import toml
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit, join_room
@@ -20,6 +21,12 @@ active_jobs = {}
 job_statistics = defaultdict(list)
 # Store log buffers per job
 job_logs = defaultdict(list)
+# Store job metadata (steps_per_epoch, epochs, total_steps, gradient_accumulation_steps, iter_times, last_step_time)
+job_metadata = defaultdict(dict)
+
+# Memory management constants
+MAX_LOG_LINES = 10000
+PRUNE_THRESHOLD_MULTIPLIER = 1.2
 
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -38,7 +45,17 @@ def ensure_job_dir(job_name):
     return job_path
 
 
-def parse_log_line(line):
+def prune_logs(job_name):
+    """Prune log buffer if it exceeds threshold."""
+    if job_name not in job_logs:
+        return
+    logs_list = job_logs[job_name]
+    threshold = int(MAX_LOG_LINES * PRUNE_THRESHOLD_MULTIPLIER)
+    if len(logs_list) > threshold:
+        job_logs[job_name] = logs_list[-MAX_LOG_LINES:]
+
+
+def parse_log_line(line, job_name):
     """Parse a log line to extract statistics."""
     # Pattern: steps: 5 loss: 0.6502
     pattern = r'steps:\s*(\d+)\s+loss:\s*([\d.]+)'
@@ -46,7 +63,91 @@ def parse_log_line(line):
     if match:
         step = int(match.group(1))
         loss = float(match.group(2))
-        return {'step': step, 'loss': loss, 'timestamp': datetime.now().isoformat()}
+        current_time = datetime.now()
+        result = {'step': step, 'loss': loss, 'timestamp': current_time.isoformat()}
+        
+        # Initialize metadata if needed
+        if job_name not in job_metadata:
+            job_metadata[job_name] = {}
+        metadata = job_metadata[job_name]
+        
+        # Calculate iter time from time between steps if we have previous step time
+        if 'last_step_time' in metadata and 'last_step' in metadata:
+            time_diff = (current_time - metadata['last_step_time']).total_seconds()
+            steps_diff = step - metadata['last_step']
+            if steps_diff > 0 and time_diff > 0:
+                # Calculate iter time: time_diff covers steps_diff steps
+                # steps_per_iter = gradient_accumulation_steps
+                steps_per_iter = metadata.get('gradient_accumulation_steps', 1)
+                if steps_per_iter > 0:
+                    # Time per iter = time_diff / (steps_diff / steps_per_iter)
+                    iter_time = time_diff / (steps_diff / steps_per_iter)
+                    if 'iter_times' not in metadata:
+                        metadata['iter_times'] = []
+                    metadata['iter_times'].append(iter_time)
+                    # Keep last 10 iter times for averaging
+                    if len(metadata['iter_times']) > 10:
+                        metadata['iter_times'].pop(0)
+        
+        metadata['last_step'] = step
+        metadata['last_step_time'] = current_time
+        
+        # Calculate total_steps and ETA if we have the necessary data
+        if 'total_steps' in metadata:
+            result['total_steps'] = metadata['total_steps']
+            # Calculate ETA
+            if 'iter_times' in metadata and len(metadata['iter_times']) > 0:
+                avg_iter_time = sum(metadata['iter_times']) / len(metadata['iter_times'])
+                steps_per_iter = metadata.get('gradient_accumulation_steps', 1)
+                remaining_steps = metadata['total_steps'] - step
+                if remaining_steps > 0 and steps_per_iter > 0:
+                    eta_seconds = (remaining_steps / steps_per_iter) * avg_iter_time
+                    result['eta_seconds'] = eta_seconds
+        
+        return result
+    
+    # Parse steps_per_epoch: oooooooooooooooooooooo steps_per_epoch: 131
+    steps_per_epoch_pattern = r'oooooooooooooooooooooo steps_per_epoch:\s*(\d+)'
+    match = re.search(steps_per_epoch_pattern, line)
+    if match and job_name:
+        steps_per_epoch = int(match.group(1))
+        if job_name not in job_metadata:
+            job_metadata[job_name] = {}
+        job_metadata[job_name]['steps_per_epoch'] = steps_per_epoch
+        
+        # Calculate total_steps if we have epochs
+        if 'epochs' in job_metadata[job_name]:
+            job_metadata[job_name]['total_steps'] = steps_per_epoch * job_metadata[job_name]['epochs']
+    
+    # Parse iter time from deepspeed logs
+    # Common patterns: "iter time: X.XXs", "iter: X.XXs", "time: X.XXs", "X.XXs/iter"
+    # Also handle milliseconds: "iter time: X.XXms"
+    iter_time_patterns = [
+        r'iter\s+time:\s*([\d.]+)\s*(?:s|sec|seconds)',
+        r'iter:\s*([\d.]+)\s*(?:s|sec|seconds)',
+        r'time:\s*([\d.]+)\s*(?:s|sec|seconds).*iter',
+        r'([\d.]+)\s*(?:s|sec|seconds)\s*/iter',
+        r'iter\s+time:\s*([\d.]+)\s*ms',  # milliseconds
+        r'([\d.]+)\s*ms\s*/iter',  # milliseconds
+    ]
+    for pattern in iter_time_patterns:
+        match = re.search(pattern, line, re.IGNORECASE)
+        if match and job_name:
+            iter_time = float(match.group(1))
+            # Convert milliseconds to seconds if needed
+            if 'ms' in line.lower():
+                iter_time = iter_time / 1000.0
+            
+            if job_name not in job_metadata:
+                job_metadata[job_name] = {}
+            if 'iter_times' not in job_metadata[job_name]:
+                job_metadata[job_name]['iter_times'] = []
+            # Keep last 10 iter times for averaging
+            job_metadata[job_name]['iter_times'].append(iter_time)
+            if len(job_metadata[job_name]['iter_times']) > 10:
+                job_metadata[job_name]['iter_times'].pop(0)
+            break
+    
     return None
 
 
@@ -66,12 +167,14 @@ def stream_job_output(job_name, process):
             if line:
                 # Store log line
                 job_logs[job_name].append(line)
+                # Prune logs if they exceed threshold
+                prune_logs(job_name)
                 
                 # Emit log line via WebSocket
                 socketio.emit('log_line', {'line': line}, room=job_name)
                 
                 # Parse statistics
-                stats = parse_log_line(line)
+                stats = parse_log_line(line, job_name)
                 if stats:
                     job_statistics[job_name].append(stats)
                     socketio.emit('statistics', {'stats': stats}, room=job_name)
@@ -125,10 +228,18 @@ def get_jobs_overview():
         # Get last statistics
         last_step = None
         last_loss = None
+        step_display = None
         if job_name in job_statistics and job_statistics[job_name]:
             last_stat = job_statistics[job_name][-1]
             last_step = last_stat['step']
             last_loss = last_stat['loss']
+            
+            # Format step display as "current/total" or "current/?"
+            total_steps = last_stat.get('total_steps') or job_metadata.get(job_name, {}).get('total_steps')
+            if total_steps:
+                step_display = f"{last_step}/{total_steps}"
+            else:
+                step_display = f"{last_step}/?"
         
         # Check if config files exist
         has_config = (job_path / 'job_config.toml').exists()
@@ -138,6 +249,7 @@ def get_jobs_overview():
             'job_name': job_name,
             'status': status,
             'last_step': last_step,
+            'step_display': step_display,
             'last_loss': last_loss,
             'has_config': has_config,
             'has_dataset': has_dataset
@@ -210,10 +322,31 @@ def get_job_status(job_name):
     is_running = job_name in active_jobs
     process = active_jobs.get(job_name)
     
+    # Get statistics and enhance with total_steps and ETA
+    # Return all statistics (not just last 100) to ensure full history available
+    statistics = job_statistics[job_name] if job_name in job_statistics else []
+    
+    # Add total_steps and ETA to each stat if not already present
+    metadata = job_metadata.get(job_name, {})
+    total_steps = metadata.get('total_steps')
+    for stat in statistics:
+        if 'total_steps' not in stat and total_steps:
+            stat['total_steps'] = total_steps
+        # Calculate ETA if not present
+        if 'eta_seconds' not in stat and 'step' in stat:
+            step = stat['step']
+            if total_steps and 'iter_times' in metadata and len(metadata['iter_times']) > 0:
+                avg_iter_time = sum(metadata['iter_times']) / len(metadata['iter_times'])
+                steps_per_iter = metadata.get('gradient_accumulation_steps', 1)
+                remaining_steps = total_steps - step
+                if remaining_steps > 0 and steps_per_iter > 0:
+                    stat['eta_seconds'] = (remaining_steps / steps_per_iter) * avg_iter_time
+    
     status = {
         'running': is_running,
-        'statistics': job_statistics[job_name][-100:] if job_name in job_statistics else [],  # Last 100 points
-        'log_count': len(job_logs.get(job_name, []))
+        'statistics': statistics,
+        'log_count': len(job_logs.get(job_name, [])),
+        'total_steps': total_steps
     }
     
     if process:
@@ -233,9 +366,30 @@ def launch_job(job_name):
     if not job_config.exists():
         return jsonify({'error': 'Job config file not found'}), 404
     
-    # Clear previous statistics and logs
+    # Clear previous statistics and logs (but keep metadata like steps_per_epoch)
     job_statistics[job_name] = []
     job_logs[job_name] = []
+    # Reset step tracking for iter time calculation
+    if job_name in job_metadata:
+        job_metadata[job_name].pop('last_step', None)
+        job_metadata[job_name].pop('last_step_time', None)
+    
+    # Read job config to extract epochs and gradient_accumulation_steps
+    try:
+        with open(job_config, 'r') as f:
+            config = toml.load(f)
+            if job_name not in job_metadata:
+                job_metadata[job_name] = {}
+            if 'epochs' in config:
+                job_metadata[job_name]['epochs'] = config['epochs']
+            if 'gradient_accumulation_steps' in config:
+                job_metadata[job_name]['gradient_accumulation_steps'] = config['gradient_accumulation_steps']
+            # Calculate total_steps if we already have steps_per_epoch
+            if 'steps_per_epoch' in job_metadata[job_name] and 'epochs' in job_metadata[job_name]:
+                job_metadata[job_name]['total_steps'] = job_metadata[job_name]['steps_per_epoch'] * job_metadata[job_name]['epochs']
+    except Exception as e:
+        # If config reading fails, continue anyway - we'll try to parse from logs
+        pass
     
     try:
         # Construct command - check for venv in common locations
