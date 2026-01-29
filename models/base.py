@@ -288,6 +288,23 @@ class BasePipeline:
     def prepare_block_swap_inference(self, disable_block_swap=False):
         pass
 
+    def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
+        """
+        Generate sample images from text prompts.
+        
+        Args:
+            prompts: List of text prompts
+            num_inference_steps: Number of sampling steps
+            height: Image height in pixels
+            width: Image width in pixels
+            seed: Random seed for reproducibility
+            guidance_scale: Guidance scale (CFG) if supported by model
+            
+        Returns:
+            List of PIL Images
+        """
+        raise NotImplementedError('generate_samples() must be implemented by model-specific pipeline classes')
+
 
 def encode_token_weights(self, token_weight_pairs):
     to_encode = list()
@@ -610,3 +627,141 @@ class ComfyPipeline:
 
     def prepare_block_swap_inference(self, disable_block_swap=False):
         pass
+
+    def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
+        """
+        Generate sample images from text prompts.
+        
+        Generic implementation for ComfyPipeline models using flow matching.
+        Model-specific pipelines can override this for custom behavior.
+        
+        Args:
+            prompts: List of text prompts
+            num_inference_steps: Number of sampling steps
+            height: Image height in pixels
+            width: Image width in pixels
+            seed: Random seed for reproducibility
+            guidance_scale: Guidance scale (CFG) if supported by model
+            
+        Returns:
+            List of PIL Images
+        """
+        import torchvision
+        from PIL import Image
+        import numpy as np
+        
+        # Set random seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        
+        device = next(self.diffusion_model.parameters()).device
+        dtype = self.model_config['dtype']
+        
+        # Round height/width to multiple of patch size (default 16 for most models)
+        patch_size = getattr(self.diffusion_model, 'patch_size', 16)
+        height = ((height + patch_size - 1) // patch_size) * patch_size
+        width = ((width + patch_size - 1) // patch_size) * patch_size
+        
+        # Latent dimensions (most ComfyUI models use 8x downsampling VAE)
+        latent_height = height // 8
+        latent_width = width // 8
+        # Get latent channels from VAE or model
+        vae = self.get_vae()
+        vae.load_model_if_needed()
+        latent_channels = getattr(vae.model, 'latent_channels', getattr(self.diffusion_model, 'in_channels', 16))
+        
+        # Encode prompts
+        text_encoder = self.text_encoders[0]
+        text_encoder.load_model_if_needed()
+        text_encoder_fn = self.get_call_text_encoder_fn(text_encoder)
+        is_video_list = [False] * len(prompts)
+        text_encoding = text_encoder_fn(prompts, is_video_list)
+        text_embeds_list = text_encoding['text_embeds_0']
+        attention_mask_list = text_encoding['attention_mask_0']
+        
+        # Convert to tensors and pad to same length
+        max_seq_len = max(te.shape[0] for te in text_embeds_list)
+        text_embeds = torch.stack([
+            torch.cat([te, te.new_zeros(max_seq_len - te.shape[0], te.shape[1])])
+            for te in text_embeds_list
+        ]).to(device, dtype)
+        attention_mask = torch.stack([
+            torch.cat([am, am.new_zeros(max_seq_len - am.shape[0])])
+            for am in attention_mask_list
+        ]).to(device)
+        attention_mask = attention_mask.to(torch.bool)
+        
+        # Initialize latents with random noise
+        latents = torch.randn(len(prompts), latent_channels, latent_height, latent_width, device=device, dtype=dtype)
+        
+        # Process latents through model_patcher
+        latents = self.model_patcher.model.process_latent_in(latents)
+        
+        # Flow matching sampling: Euler steps from t=1 to t=0
+        dt = 1.0 / num_inference_steps
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        
+        self.diffusion_model.eval()
+        with torch.no_grad():
+            for i in range(num_inference_steps):
+                t = timesteps[i]
+                t_tensor = t.expand(len(prompts)).to(device, dtype)
+                
+                # Create inputs dict for prepare_inputs
+                inputs_dict = {
+                    'latents': latents,
+                    'text_embeds_0': text_embeds_list,
+                    'attention_mask_0': attention_mask_list,
+                    'mask': None,
+                }
+                
+                # Prepare inputs (this creates noisy_latents from latents at timestep t)
+                # But for sampling, we want to use current latents directly
+                # So we'll manually construct model inputs
+                model_inputs, _ = self.prepare_inputs(inputs_dict, timestep_quantile=None)
+                # Override timestep with our sampling timestep
+                model_inputs_list = list(model_inputs)
+                model_inputs_list[1] = t_tensor  # Replace timestep
+                model_inputs = tuple(model_inputs_list)
+                
+                # Forward through layers
+                layers = self.to_layers()
+                x = model_inputs
+                for layer in layers:
+                    x = layer(x)
+                
+                # x is the predicted target
+                predicted_target = x
+                
+                # Euler step: latents_{t-dt} = latents_t - dt * predicted_target
+                latents = latents - dt * predicted_target
+                
+        # Decode latents with VAE
+        vae.model.to(device)
+        latents = self.model_patcher.model.process_latent_out(latents)
+        
+        # Decode
+        with torch.no_grad():
+            latents_for_vae = latents.movedim(1, -1)
+            decoded = vae.decode(latents_for_vae.to(vae.device, vae.dtype))
+            
+            if hasattr(decoded, 'sample'):
+                decoded = decoded.sample
+            elif isinstance(decoded, dict):
+                decoded = decoded['sample']
+            
+            if decoded.dim() == 4 and decoded.shape[-1] == 3:
+                decoded = decoded.movedim(-1, 1)
+            
+            # Convert to PIL images
+            images = []
+            for i in range(len(prompts)):
+                img = decoded[i].cpu().float()
+                img = (img + 1) / 2
+                img = img.clamp(0, 1)
+                pil_img = torchvision.transforms.functional.to_pil_image(img)
+                images.append(pil_img)
+        
+        return images

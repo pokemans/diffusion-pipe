@@ -1149,6 +1149,115 @@ def copy_job_endpoint(job_name):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/jobs/<job_name>/samples', methods=['GET'])
+def get_job_samples(job_name):
+    """Get sample images for a job, organized by epoch."""
+    try:
+        # Read job config to get output_dir
+        job_config_path = get_job_path(job_name) / 'job_config.toml'
+        if not job_config_path.exists():
+            return jsonify({'error': 'Job config not found'}), 404
+        
+        config = toml.load(job_config_path)
+        output_dir_str = config.get('output_dir', '')
+        
+        if not output_dir_str:
+            return jsonify({'samples': []})
+        
+        # Handle both absolute and relative paths
+        output_dir = Path(output_dir_str)
+        if not output_dir.is_absolute():
+            # Relative path - assume relative to project root
+            output_dir = PROJECT_ROOT / output_dir
+        
+        if not output_dir.exists():
+            return jsonify({'samples': []})
+        
+        # Find most recent run directory
+        run_dirs = sorted([d for d in output_dir.iterdir() if d.is_dir()], 
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        if not run_dirs:
+            return jsonify({'samples': []})
+        
+        most_recent_run = run_dirs[0]
+        
+        # Scan for epoch directories with sample images
+        samples_by_epoch = []
+        epoch_dirs = sorted([d for d in most_recent_run.iterdir() if d.is_dir() and d.name.startswith('epoch')],
+                           key=lambda p: int(p.name.replace('epoch', '')) if p.name.replace('epoch', '').isdigit() else 0)
+        
+        for epoch_dir in epoch_dirs:
+            # Extract epoch number
+            epoch_num_str = epoch_dir.name.replace('epoch', '')
+            try:
+                epoch_num = int(epoch_num_str)
+            except ValueError:
+                continue
+            
+            # Find sample images in this epoch directory
+            sample_files = sorted(epoch_dir.glob('sample_*.png'))
+            if sample_files:
+                samples = []
+                for sample_file in sample_files:
+                    # Extract sample index from filename (sample_0.png -> 0)
+                    sample_idx_str = sample_file.stem.replace('sample_', '')
+                    try:
+                        sample_idx = int(sample_idx_str)
+                        # Use absolute path for serving (URL encode the path)
+                        import urllib.parse
+                        encoded_path = urllib.parse.quote(str(sample_file), safe='')
+                        samples.append({
+                            'index': sample_idx,
+                            'filename': sample_file.name,
+                            'path': f'/api/jobs/{job_name}/samples/file?path={encoded_path}'
+                        })
+                    except ValueError:
+                        continue
+                
+                if samples:
+                    samples_by_epoch.append({
+                        'epoch': epoch_num,
+                        'epoch_dir': epoch_dir.name,
+                        'samples': sorted(samples, key=lambda x: x['index']),
+                        'num_samples': len(samples)
+                    })
+        
+        return jsonify({
+            'samples': sorted(samples_by_epoch, key=lambda x: x['epoch']),
+            'run_dir': str(most_recent_run.name)
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/jobs/<job_name>/samples/file', methods=['GET'])
+def get_sample_file(job_name):
+    """Serve a sample image file."""
+    try:
+        import urllib.parse
+        file_path_str = request.args.get('path')
+        if not file_path_str:
+            return jsonify({'error': 'Path parameter required'}), 400
+        
+        # URL decode the path
+        file_path_str = urllib.parse.unquote(file_path_str)
+        file_path = Path(file_path_str)
+        
+        # Security check: ensure path exists and is a file
+        if not file_path.exists() or not file_path.is_file():
+            return jsonify({'error': 'File not found'}), 404
+        
+        # Additional security: check file extension
+        if file_path.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
+            return jsonify({'error': 'Invalid file type'}), 400
+        
+        return send_from_directory(file_path.parent, file_path.name)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @socketio.on('connect')
 def handle_connect():
     """Handle WebSocket connection."""

@@ -139,6 +139,20 @@ def set_config_defaults(config):
     config.setdefault('compile', False)
     config.setdefault('x_axis_examples', False)
 
+    # Sample generation config
+    if 'sample_generation' in config:
+        sample_gen_config = config['sample_generation']
+        sample_gen_config.setdefault('enabled', True)
+        sample_gen_config.setdefault('every_n_epochs', 1)
+        sample_gen_config.setdefault('num_inference_steps', 20)
+        sample_gen_config.setdefault('height', 512)
+        sample_gen_config.setdefault('width', 512)
+        sample_gen_config.setdefault('seed', 42)
+        if 'prompts' not in sample_gen_config:
+            raise ValueError('sample_generation.prompts must be specified when sample_generation is enabled')
+    else:
+        config['sample_generation'] = {'enabled': False}
+
 
 def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
@@ -237,6 +251,75 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
     empty_cuda_cache()
     model.prepare_block_swap_training()
+
+
+def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writer, disable_block_swap):
+    """Generate sample images during training."""
+    sample_gen_config = config.get('sample_generation', {})
+    if not sample_gen_config.get('enabled', False):
+        return
+    
+    if not is_main_process():
+        return
+    
+    empty_cuda_cache()
+    model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
+    
+    try:
+        with torch.no_grad(), isolate_rng():
+            # Set seed for reproducibility
+            seed = sample_gen_config.get('seed', 42)
+            random.seed(seed)
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            
+            prompts = sample_gen_config['prompts']
+            num_inference_steps = sample_gen_config.get('num_inference_steps', 20)
+            height = sample_gen_config.get('height', 512)
+            width = sample_gen_config.get('width', 512)
+            guidance_scale = sample_gen_config.get('guidance_scale', None)
+            
+            # Generate images
+            images = model.generate_samples(
+                prompts=prompts,
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                seed=seed,
+                guidance_scale=guidance_scale
+            )
+            
+            # Save images to save_dir (epoch directory)
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            for i, (prompt, image) in enumerate(zip(prompts, images)):
+                # Save image
+                image_path = save_dir / f'sample_{i}.png'
+                image.save(image_path)
+                
+                # Log to TensorBoard
+                if tb_writer:
+                    # Convert PIL to tensor for TensorBoard
+                    import torchvision.transforms.functional as TF
+                    img_tensor = TF.to_tensor(image)
+                    tb_writer.add_image(f'samples/prompt_{i}', img_tensor, step)
+                    tb_writer.add_text(f'samples/prompt_{i}_text', prompt, step)
+                
+                # Log to WandB if enabled
+                if wandb_enable:
+                    import wandb
+                    wandb.log({
+                        f'samples/prompt_{i}': wandb.Image(image, caption=prompt),
+                        'step': step
+                    })
+            
+            if is_main_process():
+                print(f'Generated {len(images)} sample images in {save_dir}')
+                
+    finally:
+        empty_cuda_cache()
+        model.prepare_block_swap_training()
 
 
 def distributed_init(args):
@@ -904,6 +987,15 @@ if __name__ == '__main__':
                     wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
             epoch_loss = 0
             num_steps = 0
+            
+            # Generate samples if enabled and it's time
+            sample_gen_config = config.get('sample_generation', {})
+            if sample_gen_config.get('enabled', False) and saved:
+                every_n_epochs = sample_gen_config.get('every_n_epochs', 1)
+                if epoch % every_n_epochs == 0:
+                    save_dir = Path(run_dir) / f'epoch{epoch}'
+                    generate_samples(model, model_engine, config, epoch, x_axis, save_dir, tb_writer, disable_block_swap_for_eval)
+            
             if new_epoch is None:
                 final_model_name = f'epoch{epoch}'
                 break

@@ -119,6 +119,138 @@ class ZImagePipeline(ComfyPipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
+        """
+        Generate sample images using flow matching sampling.
+        
+        Note: This implementation currently works best with pipeline_stages=1.
+        For pipeline parallelism, a more complex implementation would be needed.
+        
+        For ZImage, the model predicts target = latents - noise.
+        During sampling, we start with noise at t=1 and iteratively denoise to t=0.
+        """
+        import torchvision
+        from PIL import Image
+        import numpy as np
+        
+        # Set random seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        
+        device = next(self.diffusion_model.parameters()).device
+        dtype = self.model_config['dtype']
+        
+        # Get patch size from model
+        patch_size = getattr(self.diffusion_model, 'patch_size', 16)
+        
+        # Round height/width to multiple of patch size
+        height = ((height + patch_size - 1) // patch_size) * patch_size
+        width = ((width + patch_size - 1) // patch_size) * patch_size
+        
+        # Latent dimensions - z_image uses VAE latents
+        # Get VAE to determine latent dimensions
+        vae = self.get_vae()
+        vae.load_model_if_needed()
+        # z_image typically uses 8x downsampling VAE
+        latent_height = height // 8
+        latent_width = width // 8
+        # Get latent channels from VAE or model
+        latent_channels = getattr(vae.model, 'latent_channels', getattr(self.diffusion_model, 'in_channels', 16))
+        
+        # Encode prompts
+        text_encoder = self.text_encoders[0]
+        text_encoder.load_model_if_needed()
+        text_encoder_fn = self.get_call_text_encoder_fn(text_encoder)
+        is_video_list = [False] * len(prompts)
+        text_encoding = text_encoder_fn(prompts, is_video_list)
+        text_embeds_list = text_encoding['text_embeds_0']  # List of tensors
+        attention_mask_list = text_encoding['attention_mask_0']  # List of tensors
+        
+        # Convert to tensors and pad to same length (same as prepare_inputs does)
+        max_seq_len = max(te.shape[0] for te in text_embeds_list)
+        text_embeds = torch.stack([
+            torch.cat([te, te.new_zeros(max_seq_len - te.shape[0], te.shape[1])])
+            for te in text_embeds_list
+        ]).to(device, dtype)
+        attention_mask = torch.stack([
+            torch.cat([am, am.new_zeros(max_seq_len - am.shape[0])])
+            for am in attention_mask_list
+        ]).to(device)
+        attention_mask = attention_mask.to(torch.bool)
+        
+        # Initialize latents with random noise (VAE latent space)
+        latents = torch.randn(len(prompts), latent_channels, latent_height, latent_width, device=device, dtype=dtype)
+        
+        # Process latents through model_patcher
+        latents = self.model_patcher.model.process_latent_in(latents)
+        
+        # Flow matching sampling: Euler steps from t=1 to t=0
+        dt = 1.0 / num_inference_steps
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        
+        self.diffusion_model.eval()
+        with torch.no_grad():
+            for i in range(num_inference_steps):
+                t = timesteps[i]
+                
+                # Create timestep tensor
+                t_tensor = t.expand(len(prompts)).to(device, dtype)
+                
+                # InitialLayer expects: (x, timesteps, cap_feats, cap_mask)
+                # where x is the noisy latents, timesteps is t, cap_feats is text_embeds, cap_mask is attention_mask
+                model_inputs = (latents, t_tensor, text_embeds, attention_mask)
+                
+                # Forward through layers
+                layers = self.to_layers()
+                x = model_inputs
+                for layer in layers:
+                    x = layer(x)
+                
+                # x is the predicted target (latents - noise)
+                predicted_target = x
+                
+                # Euler step: latents_{t-dt} = latents_t - dt * predicted_target
+                # For z_image: target = latents - noise, so we move towards clean latents
+                latents = latents - dt * predicted_target
+                
+        # Decode latents with VAE (already loaded above)
+        vae.model.to(device)
+        
+        # Process latents back through model_patcher
+        latents = self.model_patcher.model.process_latent_out(latents)
+        
+        # Decode
+        with torch.no_grad():
+            # ComfyUI VAE decode format
+            # Move channel dim to end: (B, C, H, W) -> (B, H, W, C)
+            latents_for_vae = latents.movedim(1, -1)
+            decoded = vae.decode(latents_for_vae.to(vae.device, vae.dtype))
+            
+            # ComfyUI VAE returns an object with .sample attribute
+            if hasattr(decoded, 'sample'):
+                decoded = decoded.sample
+            elif isinstance(decoded, dict):
+                decoded = decoded['sample']
+            
+            # Move channel back to front: (B, H, W, C) -> (B, C, H, W)
+            if decoded.dim() == 4 and decoded.shape[-1] == 3:
+                decoded = decoded.movedim(-1, 1)
+            
+            # Convert to PIL images
+            images = []
+            for i in range(len(prompts)):
+                img = decoded[i].cpu().float()
+                # VAE output is in range [-1, 1], convert to [0, 1]
+                img = (img + 1) / 2
+                img = img.clamp(0, 1)
+                # Convert to PIL
+                pil_img = torchvision.transforms.functional.to_pil_image(img)
+                images.append(pil_img)
+        
+        return images
+
 
 class InitialLayer(nn.Module):
     def __init__(self, model):
