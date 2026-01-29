@@ -87,6 +87,33 @@
                         <div class="plot-header">
                             <h3>Loss vs Steps</h3>
                         </div>
+                        <div class="plot-controls">
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="movingAvgToggle">
+                                    Moving Average
+                                </label>
+                                <div id="windowSizeGroup" class="window-size-group hidden">
+                                    <label for="windowSizeSlider">Window Size:</label>
+                                    <input type="range" id="windowSizeSlider" min="1" max="50" value="10">
+                                    <span id="windowSizeValue">10</span>
+                                </div>
+                            </div>
+                            <div class="control-group">
+                                <label for="minStepInput">Min Step:</label>
+                                <input type="number" id="minStepInput" min="0" placeholder="Auto">
+                                <label for="maxStepInput">Max Step:</label>
+                                <input type="number" id="maxStepInput" min="0" placeholder="Auto">
+                                <button id="applyRangeBtn" class="small-btn">Apply Range</button>
+                            </div>
+                            <div class="control-group">
+                                <button id="resetZoomBtn" class="small-btn">Reset Zoom</button>
+                                <label id="showRawLabel" class="hidden">
+                                    <input type="checkbox" id="showRawToggle">
+                                    Show Raw
+                                </label>
+                            </div>
+                        </div>
                         <div id="lossPlot" class="plot"></div>
                     </div>
                 </div>
@@ -97,7 +124,19 @@
     <script>
         let socket = null;
         let currentJob = null;
-        let lossData = { steps: [], losses: [] };
+        let lossData = {
+            rawSteps: [],
+            rawLosses: [],
+            steps: [],
+            losses: []
+        };
+        let plotSettings = {
+            movingAverage: false,
+            windowSize: 10,
+            minStep: null,
+            maxStep: null,
+            showRaw: false
+        };
         let overviewRefreshInterval = null;
 
         // Initialize
@@ -158,6 +197,62 @@
             // Clear logs
             document.getElementById('clearLogsBtn').addEventListener('click', () => {
                 document.getElementById('logDisplay').innerHTML = '';
+            });
+
+            // Plot controls
+            document.getElementById('movingAvgToggle').addEventListener('change', (e) => {
+                plotSettings.movingAverage = e.target.checked;
+                const windowSizeGroup = document.getElementById('windowSizeGroup');
+                const showRawLabel = document.getElementById('showRawLabel');
+                if (plotSettings.movingAverage) {
+                    windowSizeGroup.classList.remove('hidden');
+                    showRawLabel.classList.remove('hidden');
+                } else {
+                    windowSizeGroup.classList.add('hidden');
+                    showRawLabel.classList.add('hidden');
+                    plotSettings.showRaw = false;
+                    document.getElementById('showRawToggle').checked = false;
+                }
+                applyPlotSettings();
+                updatePlot();
+            });
+
+            document.getElementById('windowSizeSlider').addEventListener('input', (e) => {
+                plotSettings.windowSize = parseInt(e.target.value);
+                document.getElementById('windowSizeValue').textContent = plotSettings.windowSize;
+                if (plotSettings.movingAverage) {
+                    applyPlotSettings();
+                    updatePlot();
+                }
+            });
+
+            document.getElementById('applyRangeBtn').addEventListener('click', () => {
+                const minStepInput = document.getElementById('minStepInput');
+                const maxStepInput = document.getElementById('maxStepInput');
+                const minStep = minStepInput.value.trim() === '' ? null : parseInt(minStepInput.value);
+                const maxStep = maxStepInput.value.trim() === '' ? null : parseInt(maxStepInput.value);
+                
+                if (minStep !== null && maxStep !== null && minStep >= maxStep) {
+                    alert('Min step must be less than max step');
+                    return;
+                }
+                
+                plotSettings.minStep = minStep;
+                plotSettings.maxStep = maxStep;
+                applyPlotSettings();
+                updatePlot();
+            });
+
+            document.getElementById('resetZoomBtn').addEventListener('click', () => {
+                Plotly.relayout('lossPlot', {
+                    'xaxis.autorange': true,
+                    'yaxis.autorange': true
+                });
+            });
+
+            document.getElementById('showRawToggle').addEventListener('change', (e) => {
+                plotSettings.showRaw = e.target.checked;
+                updatePlot();
             });
         }
 
@@ -383,7 +478,17 @@
                 if (response.ok) {
                     // Clear previous logs and plot
                     document.getElementById('logDisplay').innerHTML = '';
-                    lossData = { steps: [], losses: [] };
+                    lossData = {
+                        rawSteps: [],
+                        rawLosses: [],
+                        steps: [],
+                        losses: []
+                    };
+                    plotSettings.minStep = null;
+                    plotSettings.maxStep = null;
+                    document.getElementById('minStepInput').value = '';
+                    document.getElementById('maxStepInput').value = '';
+                    applyPlotSettings();
                     updatePlot();
 
                     // Update UI
@@ -446,8 +551,9 @@
 
                 // Update plot with existing statistics
                 if (status.statistics && status.statistics.length > 0) {
-                    lossData.steps = status.statistics.map(s => s.step);
-                    lossData.losses = status.statistics.map(s => s.loss);
+                    lossData.rawSteps = status.statistics.map(s => s.step);
+                    lossData.rawLosses = status.statistics.map(s => s.loss);
+                    applyPlotSettings();
                     updatePlot();
                 }
             } catch (error) {
@@ -477,8 +583,9 @@
 
             socket.on('statistics', (data) => {
                 const stats = data.stats;
-                lossData.steps.push(stats.step);
-                lossData.losses.push(stats.loss);
+                lossData.rawSteps.push(stats.step);
+                lossData.rawLosses.push(stats.loss);
+                applyPlotSettings();
                 updatePlot();
             });
 
@@ -497,26 +604,123 @@
             });
         }
 
-        function updatePlot() {
-            const trace = {
-                x: lossData.steps,
-                y: lossData.losses,
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: 'Loss',
-                line: { color: '#007bff' },
-                marker: { size: 4 }
-            };
+        function calculateMovingAverage(values, windowSize) {
+            if (values.length === 0) return [];
+            if (windowSize <= 1) return values;
+            
+            const smoothed = [];
+            const halfWindow = Math.floor(windowSize / 2);
+            
+            for (let i = 0; i < values.length; i++) {
+                const start = Math.max(0, i - halfWindow);
+                const end = Math.min(values.length, i + halfWindow + 1);
+                const window = values.slice(start, end);
+                const avg = window.reduce((a, b) => a + b, 0) / window.length;
+                smoothed.push(avg);
+            }
+            
+            return smoothed;
+        }
 
+        function applyStepRange(steps, losses, minStep, maxStep) {
+            if (steps.length === 0) return { steps: [], losses: [] };
+            
+            let filteredSteps = steps;
+            let filteredLosses = losses;
+            
+            if (minStep !== null && minStep !== '') {
+                const minIdx = steps.findIndex(s => s >= minStep);
+                if (minIdx >= 0) {
+                    filteredSteps = filteredSteps.slice(minIdx);
+                    filteredLosses = filteredLosses.slice(minIdx);
+                } else {
+                    // All steps are below minStep
+                    return { steps: [], losses: [] };
+                }
+            }
+            
+            if (maxStep !== null && maxStep !== '') {
+                const maxIdx = filteredSteps.findIndex(s => s > maxStep);
+                if (maxIdx >= 0) {
+                    filteredSteps = filteredSteps.slice(0, maxIdx);
+                    filteredLosses = filteredLosses.slice(0, maxIdx);
+                }
+            }
+            
+            return { steps: filteredSteps, losses: filteredLosses };
+        }
+
+        function applyPlotSettings() {
+            // Start with raw data
+            let steps = [...lossData.rawSteps];
+            let losses = [...lossData.rawLosses];
+            
+            // Apply step range filter
+            if (plotSettings.minStep !== null || plotSettings.maxStep !== null) {
+                const filtered = applyStepRange(steps, losses, plotSettings.minStep, plotSettings.maxStep);
+                steps = filtered.steps;
+                losses = filtered.losses;
+            }
+            
+            // Apply moving average if enabled
+            if (plotSettings.movingAverage && losses.length > 0) {
+                losses = calculateMovingAverage(losses, plotSettings.windowSize);
+            }
+            
+            // Update the display arrays
+            lossData.steps = steps;
+            lossData.losses = losses;
+        }
+
+        function updatePlot() {
+            const traces = [];
+            
+            // Add smoothed/filtered trace
+            if (lossData.steps.length > 0) {
+                traces.push({
+                    x: lossData.steps,
+                    y: lossData.losses,
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: plotSettings.movingAverage ? 'Smoothed Loss' : 'Loss',
+                    line: { color: '#007bff', width: 2 },
+                    marker: { size: 4 }
+                });
+            }
+            
+            // Add raw trace if enabled and moving average is on
+            if (plotSettings.showRaw && plotSettings.movingAverage && lossData.rawSteps.length > 0) {
+                let rawSteps = [...lossData.rawSteps];
+                let rawLosses = [...lossData.rawLosses];
+                
+                // Apply step range to raw data too
+                if (plotSettings.minStep !== null || plotSettings.maxStep !== null) {
+                    const filtered = applyStepRange(rawSteps, rawLosses, plotSettings.minStep, plotSettings.maxStep);
+                    rawSteps = filtered.steps;
+                    rawLosses = filtered.losses;
+                }
+                
+                traces.push({
+                    x: rawSteps,
+                    y: rawLosses,
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: 'Raw Loss',
+                    line: { color: '#cccccc', width: 1 },
+                    marker: { size: 2, opacity: 0.5 }
+                });
+            }
+            
             const layout = {
                 title: 'Training Loss',
                 xaxis: { title: 'Steps' },
                 yaxis: { title: 'Loss' },
                 margin: { l: 60, r: 20, t: 40, b: 60 },
-                showlegend: false
+                showlegend: traces.length > 1,
+                hovermode: 'closest'
             };
 
-            Plotly.newPlot('lossPlot', [trace], layout, { responsive: true });
+            Plotly.react('lossPlot', traces, layout, { responsive: true });
         }
 
         // Poll for status updates
