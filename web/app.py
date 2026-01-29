@@ -58,6 +58,10 @@ nvml_initialized = False
 nvml_gpu_handle = None
 nvml_gpu_name = None
 
+# CPU usage history for sliding average
+cpu_usage_history = []
+CPU_HISTORY_SIZE = 10  # Keep last 10 CPU readings for average
+
 
 def get_job_path(job_name):
     """Get the path to a job directory."""
@@ -234,8 +238,20 @@ def get_system_stats():
     if PSUTIL_AVAILABLE:
         try:
             cpu_percent = psutil.cpu_percent(interval=0.1)
+            # Add to history
+            cpu_usage_history.append(cpu_percent)
+            # Keep only last N readings
+            if len(cpu_usage_history) > CPU_HISTORY_SIZE:
+                cpu_usage_history.pop(0)
+            
+            # Calculate average
+            avg_cpu = sum(cpu_usage_history) / len(cpu_usage_history) if cpu_usage_history else cpu_percent
+            
+            # Round to nearest 10
+            rounded_cpu = round(avg_cpu / 10) * 10
+            
             stats['cpu'] = {
-                'percent': round(cpu_percent, 1)
+                'percent': rounded_cpu
             }
         except Exception as e:
             print(f"Error getting CPU stats: {e}")
