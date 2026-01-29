@@ -941,9 +941,24 @@ def stop_job(job_name):
 
 @app.route('/api/jobs/<job_name>/logs', methods=['GET'])
 def get_job_logs(job_name):
-    """Get all logs for a job."""
+    """Get logs for a job. Returns most recent N lines (default 500)."""
     logs = job_logs.get(job_name, [])
-    return jsonify({'logs': logs})
+    
+    # Get number of lines from query parameter, default to 500
+    try:
+        num_lines = int(request.args.get('lines', 500))
+        num_lines = max(1, min(num_lines, 10000))  # Limit between 1 and 10000
+    except (ValueError, TypeError):
+        num_lines = 500
+    
+    # Return most recent N lines
+    recent_logs = logs[-num_lines:] if len(logs) > num_lines else logs
+    
+    return jsonify({
+        'logs': recent_logs,
+        'total_lines': len(logs),
+        'returned_lines': len(recent_logs)
+    })
 
 
 @app.route('/api/jobs/<job_name>/queue/add', methods=['POST'])

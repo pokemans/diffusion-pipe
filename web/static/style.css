@@ -299,6 +299,40 @@ button {
     align-items: center;
 }
 
+.log-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.log-controls label {
+    font-size: 12px;
+    font-weight: 500;
+    color: #2c3e50;
+}
+
+.log-lines-input {
+    width: 80px;
+    padding: 4px 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.refresh-btn {
+    padding: 4px 12px;
+    font-size: 12px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.refresh-btn:hover {
+    background-color: #0056b3;
+}
+
 .log-header h3, .plot-header h3 {
     font-size: 14px;
     color: #2c3e50;

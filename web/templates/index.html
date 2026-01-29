@@ -162,7 +162,12 @@
                     <div class="log-container">
                         <div class="log-header">
                             <h3>Logs</h3>
-                            <button id="clearLogsBtn" class="clear-btn">Clear</button>
+                            <div class="log-controls">
+                                <label for="logLinesInput">Lines:</label>
+                                <input type="number" id="logLinesInput" class="log-lines-input" min="1" max="10000" value="500">
+                                <button id="refreshLogsBtn" class="refresh-btn">Refresh</button>
+                                <button id="clearLogsBtn" class="clear-btn">Clear</button>
+                            </div>
                         </div>
                         <div id="logDisplay" class="log-display"></div>
                     </div>
@@ -346,6 +351,16 @@
             // Clear logs
             document.getElementById('clearLogsBtn').addEventListener('click', () => {
                 document.getElementById('logDisplay').innerHTML = '';
+            });
+
+            // Refresh logs
+            document.getElementById('refreshLogsBtn').addEventListener('click', () => {
+                loadJobLogs();
+            });
+
+            // Log lines input change
+            document.getElementById('logLinesInput').addEventListener('change', () => {
+                loadJobLogs();
             });
 
             // Plot controls
@@ -663,6 +678,9 @@
 
                 // Load status
                 await updateJobStatus();
+
+                // Load logs
+                await loadJobLogs();
 
                 // Connect to WebSocket
                 connectWebSocket(jobName);
@@ -1260,6 +1278,33 @@ use_venv = ${launchConfig.use_venv}
             }
         }
 
+        async function loadJobLogs() {
+            if (!currentJob) return;
+
+            const numLines = parseInt(document.getElementById('logLinesInput').value) || 500;
+            
+            try {
+                const response = await fetch(`/api/jobs/${currentJob}/logs?lines=${numLines}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    const logDisplay = document.getElementById('logDisplay');
+                    logDisplay.innerHTML = '';
+                    
+                    data.logs.forEach(line => {
+                        const lineElement = document.createElement('div');
+                        lineElement.className = 'log-line';
+                        lineElement.textContent = line;
+                        logDisplay.appendChild(lineElement);
+                    });
+                    
+                    // Scroll to bottom
+                    logDisplay.scrollTop = logDisplay.scrollHeight;
+                }
+            } catch (error) {
+                console.error('Error loading logs:', error);
+            }
+        }
+
         function connectWebSocket(jobName) {
             if (socket) {
                 socket.disconnect();
@@ -1273,10 +1318,23 @@ use_venv = ${launchConfig.use_venv}
 
             socket.on('log_line', (data) => {
                 const logDisplay = document.getElementById('logDisplay');
+                const numLines = parseInt(document.getElementById('logLinesInput').value) || 500;
+                
+                // Add new line
                 const line = document.createElement('div');
                 line.className = 'log-line';
                 line.textContent = data.line;
                 logDisplay.appendChild(line);
+                
+                // Keep only the most recent N lines
+                const lines = logDisplay.querySelectorAll('.log-line');
+                if (lines.length > numLines) {
+                    const linesToRemove = lines.length - numLines;
+                    for (let i = 0; i < linesToRemove; i++) {
+                        lines[i].remove();
+                    }
+                }
+                
                 logDisplay.scrollTop = logDisplay.scrollHeight;
             });
 
