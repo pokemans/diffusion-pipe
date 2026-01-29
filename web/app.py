@@ -259,7 +259,10 @@ def launch_job(job_name):
             # Try without venv activation (might be using system Python)
             cmd_str = f'NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 deepspeed --num_gpus=1 train.py --deepspeed --config {config_path}'
         
-        # Launch process
+        # Launch process with new process group so we can kill all children
+        def preexec_fn():
+            os.setsid()  # Create new process group
+        
         process = subprocess.Popen(
             ['bash', '-c', cmd_str],
             stdout=subprocess.PIPE,
@@ -267,7 +270,8 @@ def launch_job(job_name):
             universal_newlines=True,
             bufsize=1,
             cwd=str(PROJECT_ROOT),
-            env=dict(os.environ)  # Pass current environment
+            env=dict(os.environ),  # Pass current environment
+            preexec_fn=preexec_fn  # Create new process group
         )
         
         active_jobs[job_name] = process
@@ -289,12 +293,32 @@ def stop_job(job_name):
     
     try:
         process = active_jobs[job_name]
-        process.terminate()
-        # Wait a bit, then kill if still running
+        
+        # Kill the entire process group (including all child processes)
+        try:
+            pgid = os.getpgid(process.pid)
+            os.killpg(pgid, 15)  # SIGTERM to entire process group
+        except (ProcessLookupError, OSError):
+            # Process group doesn't exist or process already dead
+            # Fall back to killing just the process
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass  # Process already dead
+        
+        # Wait a bit, then force kill if still running
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
+            # Force kill the process group
+            try:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, 9)  # SIGKILL to entire process group
+            except (ProcessLookupError, OSError):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass  # Process already dead
         
         del active_jobs[job_name]
         socketio.emit('job_stopped', {'job_name': job_name}, room=job_name)
