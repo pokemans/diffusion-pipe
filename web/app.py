@@ -11,6 +11,21 @@ from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit, join_room
 
+# Try to import GPU and system monitoring libraries
+try:
+    import pynvml
+    NVML_AVAILABLE = True
+except ImportError:
+    NVML_AVAILABLE = False
+    pynvml = None
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
+
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -38,6 +53,11 @@ ITER_TIME_MIN_SAMPLES = 5  # Minimum samples before calculating average
 PROJECT_ROOT = Path(__file__).parent.parent
 JOBS_DIR = PROJECT_ROOT / 'jobs'
 
+# NVML initialization state
+nvml_initialized = False
+nvml_gpu_handle = None
+nvml_gpu_name = None
+
 
 def get_job_path(job_name):
     """Get the path to a job directory."""
@@ -49,6 +69,94 @@ def ensure_job_dir(job_name):
     job_path = get_job_path(job_name)
     job_path.mkdir(parents=True, exist_ok=True)
     return job_path
+
+
+def init_nvml():
+    """Initialize NVIDIA Management Library."""
+    global nvml_initialized, nvml_gpu_handle, nvml_gpu_name
+    
+    if not NVML_AVAILABLE:
+        return False
+    
+    if nvml_initialized:
+        return True
+    
+    try:
+        pynvml.nvmlInit()
+        # Get handle for first GPU (index 0)
+        nvml_gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        nvml_gpu_name = pynvml.nvmlDeviceGetName(nvml_gpu_handle).decode('utf-8')
+        nvml_initialized = True
+        return True
+    except Exception as e:
+        print(f"Failed to initialize NVML: {e}")
+        nvml_initialized = False
+        return False
+
+
+def get_system_stats():
+    """Collect system statistics including GPU, memory, and swap."""
+    stats = {
+        'gpu': {'available': False},
+        'memory': {},
+        'swap': {}
+    }
+    
+    # GPU Stats
+    if NVML_AVAILABLE and init_nvml():
+        try:
+            utilization = pynvml.nvmlDeviceGetUtilizationRates(nvml_gpu_handle)
+            memory_info = pynvml.nvmlDeviceGetMemoryInfo(nvml_gpu_handle)
+            temperature = pynvml.nvmlDeviceGetTemperature(nvml_gpu_handle, pynvml.NVML_TEMPERATURE_GPU)
+            
+            memory_used_gb = memory_info.used / (1024 ** 3)
+            memory_total_gb = memory_info.total / (1024 ** 3)
+            memory_percent = (memory_info.used / memory_info.total) * 100 if memory_info.total > 0 else 0
+            
+            stats['gpu'] = {
+                'available': True,
+                'name': nvml_gpu_name,
+                'utilization': utilization.gpu,
+                'memory_used_gb': round(memory_used_gb, 1),
+                'memory_total_gb': round(memory_total_gb, 1),
+                'memory_percent': round(memory_percent, 1),
+                'temperature': temperature
+            }
+        except Exception as e:
+            print(f"Error getting GPU stats: {e}")
+            stats['gpu']['available'] = False
+    
+    # System Memory Stats
+    if PSUTIL_AVAILABLE:
+        try:
+            memory = psutil.virtual_memory()
+            memory_used_gb = memory.used / (1024 ** 3)
+            memory_total_gb = memory.total / (1024 ** 3)
+            
+            stats['memory'] = {
+                'used_gb': round(memory_used_gb, 1),
+                'total_gb': round(memory_total_gb, 1),
+                'percent': round(memory.percent, 1)
+            }
+        except Exception as e:
+            print(f"Error getting memory stats: {e}")
+    
+    # Swap Stats
+    if PSUTIL_AVAILABLE:
+        try:
+            swap = psutil.swap_memory()
+            swap_used_gb = swap.used / (1024 ** 3)
+            swap_total_gb = swap.total / (1024 ** 3)
+            
+            stats['swap'] = {
+                'used_gb': round(swap_used_gb, 1),
+                'total_gb': round(swap_total_gb, 1),
+                'percent': round(swap.percent, 1) if swap.total > 0 else 0
+            }
+        except Exception as e:
+            print(f"Error getting swap stats: {e}")
+    
+    return stats
 
 
 def has_running_jobs():
@@ -270,6 +378,16 @@ def list_jobs():
     return jsonify({'jobs': sorted(jobs)})
 
 
+@app.route('/api/system/stats', methods=['GET'])
+def get_system_stats_endpoint():
+    """Get system statistics including GPU, memory, and swap."""
+    try:
+        stats = get_system_stats()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/jobs/overview', methods=['GET'])
 def get_jobs_overview():
     """Get overview data for all jobs, separated into running and queued lists."""
@@ -302,6 +420,7 @@ def get_jobs_overview():
         # Get statistics
         last_step = None
         last_loss = None
+        moving_avg_loss = None
         step_display = None
         eta_seconds = None
         avg_iter_time = None
@@ -312,6 +431,11 @@ def get_jobs_overview():
             last_stat = job_statistics[job_name][-1]
             last_step = last_stat['step']
             last_loss = last_stat['loss']
+            
+            # Calculate moving average of loss for running jobs (last 10 data points)
+            if is_running and len(job_statistics[job_name]) > 0:
+                recent_losses = [stat['loss'] for stat in job_statistics[job_name][-10:]]
+                moving_avg_loss = sum(recent_losses) / len(recent_losses)
             
             # Format step display as "current/total" or "current/?"
             total_steps = last_stat.get('total_steps') or metadata.get('total_steps')
@@ -348,6 +472,7 @@ def get_jobs_overview():
             'last_step': last_step,
             'step_display': step_display,
             'last_loss': last_loss,
+            'moving_avg_loss': moving_avg_loss,
             'eta_seconds': eta_seconds,
             'avg_iter_time': avg_iter_time,
             'has_config': has_config,

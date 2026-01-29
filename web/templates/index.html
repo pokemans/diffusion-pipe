@@ -12,13 +12,16 @@
 <body>
     <div class="container">
         <header>
-            <h1>Training Job Manager</h1>
+            <h1 id="headerTitle">Training Job Manager</h1>
             <div class="job-selector">
                 <label for="jobSelect">Job:</label>
                 <select id="jobSelect">
                     <option value="">Select a job...</option>
                 </select>
                 <button id="createJobBtn">Create New Job</button>
+            </div>
+            <div id="systemStats" class="system-stats">
+                <span class="stats-loading">Loading stats...</span>
             </div>
         </header>
 
@@ -181,6 +184,7 @@
             setupEventListeners();
             startOverviewRefresh();
             initializeChart();
+            startSystemStatsPolling();
         });
 
         function initializeChart() {
@@ -247,6 +251,13 @@
         }
 
         function setupEventListeners() {
+            // Header title click - navigate to overview
+            document.getElementById('headerTitle').addEventListener('click', () => {
+                document.getElementById('jobSelect').value = '';
+                hideJobContent();
+                showOverview();
+            });
+
             // Job selector
             document.getElementById('jobSelect').addEventListener('change', (e) => {
                 const jobName = e.target.value;
@@ -409,7 +420,10 @@
                 const statusClass = `status-badge ${job.status}`;
                 const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
                 const stepDisplay = job.step_display || (job.last_step !== null ? job.last_step.toString() : '-');
-                const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
+                // Use moving average loss for running jobs, fallback to last_loss if not available
+                const lossValue = job.moving_avg_loss !== null && job.moving_avg_loss !== undefined 
+                    ? job.moving_avg_loss.toFixed(4) 
+                    : (job.last_loss !== null ? job.last_loss.toFixed(4) : '-');
                 const eta = job.eta_seconds ? formatETA(job.eta_seconds) : 'N/A';
                 const iterTime = formatIterTime(job.avg_iter_time);
                 
@@ -418,7 +432,7 @@
                         <td class="job-name-cell" onclick="viewJob('${job.job_name}')">${job.job_name}</td>
                         <td><span class="${statusClass}">${statusText}</span></td>
                         <td>${stepDisplay}</td>
-                        <td>${lastLoss}</td>
+                        <td>${lossValue}</td>
                         <td>${eta}</td>
                         <td>${iterTime}</td>
                         <td class="action-buttons">
@@ -1125,6 +1139,80 @@
                 updateJobStatus();
             }
         }, 2000);
+
+        // System Statistics
+        let systemStatsInterval = null;
+
+        function formatGB(bytes) {
+            return (bytes / (1024 ** 3)).toFixed(1);
+        }
+
+        function renderSystemStats(data) {
+            const container = document.getElementById('systemStats');
+            if (!container) return;
+
+            const parts = [];
+
+            // GPU Stats
+            if (data.gpu && data.gpu.available) {
+                const gpu = data.gpu;
+                parts.push(`🖥️ ${gpu.utilization}%`);
+                parts.push(`💾 ${gpu.memory_used_gb}/${gpu.memory_total_gb} GB`);
+                parts.push(`🌡️ ${gpu.temperature}°C`);
+            }
+
+            // Memory Stats
+            if (data.memory && Object.keys(data.memory).length > 0) {
+                const mem = data.memory;
+                parts.push(`🧠 ${mem.used_gb}/${mem.total_gb} GB`);
+            }
+
+            // Swap Stats
+            if (data.swap && Object.keys(data.swap).length > 0 && data.swap.total_gb > 0) {
+                const swap = data.swap;
+                parts.push(`💿 ${swap.used_gb}/${swap.total_gb} GB`);
+            }
+
+            if (parts.length === 0) {
+                container.innerHTML = '<span class="stats-unavailable">Stats unavailable</span>';
+            } else {
+                container.innerHTML = parts.join(' | ');
+            }
+        }
+
+        async function loadSystemStats() {
+            try {
+                const response = await fetch('/api/system/stats');
+                if (response.ok) {
+                    const data = await response.json();
+                    renderSystemStats(data);
+                } else {
+                    document.getElementById('systemStats').innerHTML = '<span class="stats-unavailable">Stats unavailable</span>';
+                }
+            } catch (error) {
+                console.error('Error loading system stats:', error);
+                document.getElementById('systemStats').innerHTML = '<span class="stats-unavailable">Stats unavailable</span>';
+            }
+        }
+
+        function startSystemStatsPolling() {
+            // Load immediately
+            loadSystemStats();
+            // Then poll every 2 seconds
+            systemStatsInterval = setInterval(loadSystemStats, 2000);
+        }
+
+        function stopSystemStatsPolling() {
+            if (systemStatsInterval) {
+                clearInterval(systemStatsInterval);
+                systemStatsInterval = null;
+            }
+        }
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            stopSystemStatsPolling();
+        });
     </script>
 </body>
 </html>

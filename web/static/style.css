@@ -23,11 +23,20 @@ header {
     border-radius: 8px;
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     margin-bottom: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
 }
 
 header h1 {
     margin-bottom: 15px;
     color: #2c3e50;
+    transition: color 0.2s;
+    cursor: pointer;
+}
+
+header h1:hover {
+    color: #007bff;
 }
 
 .job-selector {
@@ -46,6 +55,34 @@ header h1 {
     border-radius: 4px;
     font-size: 14px;
     min-width: 200px;
+}
+
+/* System Statistics */
+.system-stats {
+    font-size: 12px;
+    color: #6c757d;
+    padding: 8px 12px;
+    background-color: #f8f9fa;
+    border-radius: 4px;
+    border: 1px solid #e9ecef;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.system-stats span {
+    white-space: nowrap;
+}
+
+.stats-loading {
+    color: #6c757d;
+    font-style: italic;
+}
+
+.stats-unavailable {
+    color: #adb5bd;
+    font-style: italic;
 }
 
 button {
@@ -590,6 +627,10 @@ button {
         width: 100%;
         flex-wrap: wrap;
     }
+    
+    .system-stats {
+        font-size: 11px;
+    }
 }
 
 @media (max-width: 768px) {
@@ -607,5 +648,18 @@ button {
     
     #windowSizeSlider {
         width: 80px;
+    }
+    
+    header {
+        padding: 15px;
+    }
+    
+    .system-stats {
+        font-size: 10px;
+        padding: 6px 10px;
+    }
+    
+    .job-selector {
+        flex-wrap: wrap;
     }
 }
