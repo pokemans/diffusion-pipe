@@ -518,7 +518,9 @@
         }
 
         function showOverview() {
+            currentJob = null;  // Clear current job when showing overview
             document.getElementById('jobsOverview').classList.remove('hidden');
+            loadJobsOverview();  // Load immediately
             startOverviewRefresh();
         }
 
@@ -1152,6 +1154,12 @@
             if (!container) return;
 
             const parts = [];
+
+            // CPU Stats
+            if (data.cpu && Object.keys(data.cpu).length > 0) {
+                const cpu = data.cpu;
+                parts.push(`⚙️ CPU: ${cpu.percent}%`);
+            }
 
             // GPU Stats
             if (data.gpu && data.gpu.available) {

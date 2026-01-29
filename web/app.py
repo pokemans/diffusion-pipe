@@ -100,11 +100,12 @@ def init_nvml():
 
 
 def get_system_stats():
-    """Collect system statistics including GPU, memory, and swap."""
+    """Collect system statistics including GPU, memory, swap, and CPU."""
     stats = {
         'gpu': {'available': False},
         'memory': {},
-        'swap': {}
+        'swap': {},
+        'cpu': {}
     }
     
     # GPU Stats
@@ -160,6 +161,16 @@ def get_system_stats():
             }
         except Exception as e:
             print(f"Error getting swap stats: {e}")
+    
+    # CPU Stats
+    if PSUTIL_AVAILABLE:
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            stats['cpu'] = {
+                'percent': round(cpu_percent, 1)
+            }
+        except Exception as e:
+            print(f"Error getting CPU stats: {e}")
     
     return stats
 
