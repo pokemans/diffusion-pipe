@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Training Job Manager</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Training Job Manager</h1>
+            <div class="job-selector">
+                <label for="jobSelect">Job:</label>
+                <select id="jobSelect">
+                    <option value="">Select a job...</option>
+                </select>
+                <button id="createJobBtn">Create New Job</button>
+            </div>
+        </header>
+
+        <div id="jobContent" class="hidden">
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="config">Job Config</button>
+                <button class="tab-btn" data-tab="dataset">Dataset Config</button>
+                <button class="tab-btn" data-tab="monitor">Monitor</button>
+            </div>
+
+            <div class="tab-content active" id="configTab">
+                <div class="editor-container">
+                    <div class="editor-header">
+                        <h3>Job Config (job_config.toml)</h3>
+                        <button id="saveJobConfigBtn" class="save-btn">Save</button>
+                    </div>
+                    <textarea id="jobConfigEditor" class="editor"></textarea>
+                </div>
+            </div>
+
+            <div class="tab-content" id="datasetTab">
+                <div class="editor-container">
+                    <div class="editor-header">
+                        <h3>Dataset Config (dataset.toml)</h3>
+                        <button id="saveDatasetConfigBtn" class="save-btn">Save</button>
+                    </div>
+                    <textarea id="datasetConfigEditor" class="editor"></textarea>
+                </div>
+            </div>
+
+            <div class="tab-content" id="monitorTab">
+                <div class="controls">
+                    <button id="launchBtn" class="launch-btn">Launch Job</button>
+                    <button id="stopBtn" class="stop-btn hidden">Stop Job</button>
+                    <span id="jobStatus" class="status"></span>
+                </div>
+
+                <div class="monitor-grid">
+                    <div class="log-container">
+                        <div class="log-header">
+                            <h3>Logs</h3>
+                            <button id="clearLogsBtn" class="clear-btn">Clear</button>
+                        </div>
+                        <div id="logDisplay" class="log-display"></div>
+                    </div>
+
+                    <div class="plot-container">
+                        <div class="plot-header">
+                            <h3>Loss vs Steps</h3>
+                        </div>
+                        <div id="lossPlot" class="plot"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        let currentJob = null;
+        let lossData = { steps: [], losses: [] };
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadJobs();
+            setupEventListeners();
+        });
+
+        function setupEventListeners() {
+            // Job selector
+            document.getElementById('jobSelect').addEventListener('change', (e) => {
+                const jobName = e.target.value;
+                if (jobName) {
+                    loadJob(jobName);
+                } else {
+                    hideJobContent();
+                }
+            });
+
+            // Create job button
+            document.getElementById('createJobBtn').addEventListener('click', () => {
+                const jobName = prompt('Enter job name:');
+                if (jobName && jobName.trim()) {
+                    createJob(jobName.trim());
+                }
+            });
+
+            // Tab switching
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const tab = btn.dataset.tab;
+                    switchTab(tab);
+                });
+            });
+
+            // Save buttons
+            document.getElementById('saveJobConfigBtn').addEventListener('click', () => {
+                saveJobConfig();
+            });
+
+            document.getElementById('saveDatasetConfigBtn').addEventListener('click', () => {
+                saveDatasetConfig();
+            });
+
+            // Launch/Stop buttons
+            document.getElementById('launchBtn').addEventListener('click', () => {
+                launchJob();
+            });
+
+            document.getElementById('stopBtn').addEventListener('click', () => {
+                stopJob();
+            });
+
+            // Clear logs
+            document.getElementById('clearLogsBtn').addEventListener('click', () => {
+                document.getElementById('logDisplay').innerHTML = '';
+            });
+        }
+
+        async function loadJobs() {
+            try {
+                const response = await fetch('/api/jobs');
+                const data = await response.json();
+                const select = document.getElementById('jobSelect');
+                select.innerHTML = '<option value="">Select a job...</option>';
+                data.jobs.forEach(job => {
+                    const option = document.createElement('option');
+                    option.value = job;
+                    option.textContent = job;
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Error loading jobs:', error);
+            }
+        }
+
+        async function createJob(jobName) {
+            try {
+                // Create empty config files
+                await fetch(`/api/jobs/${jobName}/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: '# Job configuration\n' })
+                });
+
+                await fetch(`/api/jobs/${jobName}/dataset`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: '# Dataset configuration\n' })
+                });
+
+                await loadJobs();
+                document.getElementById('jobSelect').value = jobName;
+                loadJob(jobName);
+            } catch (error) {
+                console.error('Error creating job:', error);
+                alert('Error creating job: ' + error.message);
+            }
+        }
+
+        async function loadJob(jobName) {
+            currentJob = jobName;
+            hideJobContent();
+
+            try {
+                // Load configs
+                const [configRes, datasetRes] = await Promise.all([
+                    fetch(`/api/jobs/${jobName}/config`),
+                    fetch(`/api/jobs/${jobName}/dataset`)
+                ]);
+
+                if (configRes.ok) {
+                    const configData = await configRes.json();
+                    document.getElementById('jobConfigEditor').value = configData.content;
+                }
+
+                if (datasetRes.ok) {
+                    const datasetData = await datasetRes.json();
+                    document.getElementById('datasetConfigEditor').value = datasetData.content;
+                }
+
+                // Load status
+                await updateJobStatus();
+
+                // Connect to WebSocket
+                connectWebSocket(jobName);
+
+                // Show content
+                document.getElementById('jobContent').classList.remove('hidden');
+            } catch (error) {
+                console.error('Error loading job:', error);
+                alert('Error loading job: ' + error.message);
+            }
+        }
+
+        function hideJobContent() {
+            document.getElementById('jobContent').classList.add('hidden');
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+        }
+
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === tabName);
+            });
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.toggle('active', content.id === `${tabName}Tab`);
+            });
+        }
+
+        async function saveJobConfig() {
+            if (!currentJob) return;
+
+            const content = document.getElementById('jobConfigEditor').value;
+            try {
+                const response = await fetch(`/api/jobs/${currentJob}/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content })
+                });
+
+                if (response.ok) {
+                    alert('Job config saved successfully');
+                } else {
+                    const error = await response.json();
+                    alert('Error saving config: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error saving config: ' + error.message);
+            }
+        }
+
+        async function saveDatasetConfig() {
+            if (!currentJob) return;
+
+            const content = document.getElementById('datasetConfigEditor').value;
+            try {
+                const response = await fetch(`/api/jobs/${currentJob}/dataset`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content })
+                });
+
+                if (response.ok) {
+                    alert('Dataset config saved successfully');
+                } else {
+                    const error = await response.json();
+                    alert('Error saving config: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error saving config: ' + error.message);
+            }
+        }
+
+        async function launchJob() {
+            if (!currentJob) return;
+
+            try {
+                const response = await fetch(`/api/jobs/${currentJob}/launch`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    // Clear previous logs and plot
+                    document.getElementById('logDisplay').innerHTML = '';
+                    lossData = { steps: [], losses: [] };
+                    updatePlot();
+
+                    // Update UI
+                    document.getElementById('launchBtn').classList.add('hidden');
+                    document.getElementById('stopBtn').classList.remove('hidden');
+                    document.getElementById('jobStatus').textContent = 'Status: Running';
+                    document.getElementById('jobStatus').className = 'status running';
+
+                    // Switch to monitor tab
+                    switchTab('monitor');
+                } else {
+                    const error = await response.json();
+                    alert('Error launching job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error launching job: ' + error.message);
+            }
+        }
+
+        async function stopJob() {
+            if (!currentJob) return;
+
+            try {
+                const response = await fetch(`/api/jobs/${currentJob}/stop`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    document.getElementById('launchBtn').classList.remove('hidden');
+                    document.getElementById('stopBtn').classList.add('hidden');
+                    document.getElementById('jobStatus').textContent = 'Status: Stopped';
+                    document.getElementById('jobStatus').className = 'status stopped';
+                } else {
+                    const error = await response.json();
+                    alert('Error stopping job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error stopping job: ' + error.message);
+            }
+        }
+
+        async function updateJobStatus() {
+            if (!currentJob) return;
+
+            try {
+                const response = await fetch(`/api/jobs/${currentJob}/status`);
+                const status = await response.json();
+
+                if (status.running) {
+                    document.getElementById('launchBtn').classList.add('hidden');
+                    document.getElementById('stopBtn').classList.remove('hidden');
+                    document.getElementById('jobStatus').textContent = 'Status: Running';
+                    document.getElementById('jobStatus').className = 'status running';
+                } else {
+                    document.getElementById('launchBtn').classList.remove('hidden');
+                    document.getElementById('stopBtn').classList.add('hidden');
+                    document.getElementById('jobStatus').textContent = 'Status: Stopped';
+                    document.getElementById('jobStatus').className = 'status stopped';
+                }
+
+                // Update plot with existing statistics
+                if (status.statistics && status.statistics.length > 0) {
+                    lossData.steps = status.statistics.map(s => s.step);
+                    lossData.losses = status.statistics.map(s => s.loss);
+                    updatePlot();
+                }
+            } catch (error) {
+                console.error('Error updating status:', error);
+            }
+        }
+
+        function connectWebSocket(jobName) {
+            if (socket) {
+                socket.disconnect();
+            }
+
+            socket = io();
+            
+            socket.on('connect', () => {
+                socket.emit('subscribe_logs', { job_name: jobName });
+            });
+
+            socket.on('log_line', (data) => {
+                const logDisplay = document.getElementById('logDisplay');
+                const line = document.createElement('div');
+                line.className = 'log-line';
+                line.textContent = data.line;
+                logDisplay.appendChild(line);
+                logDisplay.scrollTop = logDisplay.scrollHeight;
+            });
+
+            socket.on('statistics', (data) => {
+                const stats = data.stats;
+                lossData.steps.push(stats.step);
+                lossData.losses.push(stats.loss);
+                updatePlot();
+            });
+
+            socket.on('job_finished', () => {
+                document.getElementById('launchBtn').classList.remove('hidden');
+                document.getElementById('stopBtn').classList.add('hidden');
+                document.getElementById('jobStatus').textContent = 'Status: Finished';
+                document.getElementById('jobStatus').className = 'status finished';
+            });
+
+            socket.on('job_stopped', () => {
+                document.getElementById('launchBtn').classList.remove('hidden');
+                document.getElementById('stopBtn').classList.add('hidden');
+                document.getElementById('jobStatus').textContent = 'Status: Stopped';
+                document.getElementById('jobStatus').className = 'status stopped';
+            });
+        }
+
+        function updatePlot() {
+            const trace = {
+                x: lossData.steps,
+                y: lossData.losses,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: 'Loss',
+                line: { color: '#007bff' },
+                marker: { size: 4 }
+            };
+
+            const layout = {
+                title: 'Training Loss',
+                xaxis: { title: 'Steps' },
+                yaxis: { title: 'Loss' },
+                margin: { l: 60, r: 20, t: 40, b: 60 },
+                showlegend: false
+            };
+
+            Plotly.newPlot('lossPlot', [trace], layout, { responsive: true });
+        }
+
+        // Poll for status updates
+        setInterval(() => {
+            if (currentJob) {
+                updateJobStatus();
+            }
+        }, 2000);
+    </script>
+</body>
+</html>
