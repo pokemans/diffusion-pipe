@@ -100,6 +100,52 @@ def list_jobs():
     return jsonify({'jobs': sorted(jobs)})
 
 
+@app.route('/api/jobs/overview', methods=['GET'])
+def get_jobs_overview():
+    """Get overview data for all jobs."""
+    if not JOBS_DIR.exists():
+        return jsonify({'jobs': []})
+    
+    overview = []
+    jobs = [d.name for d in JOBS_DIR.iterdir() if d.is_dir()]
+    
+    for job_name in sorted(jobs):
+        job_path = get_job_path(job_name)
+        
+        # Determine status
+        if job_name in active_jobs:
+            process = active_jobs[job_name]
+            if process.poll() is None:
+                status = "running"
+            else:
+                status = "finished"
+        else:
+            status = "stopped"
+        
+        # Get last statistics
+        last_step = None
+        last_loss = None
+        if job_name in job_statistics and job_statistics[job_name]:
+            last_stat = job_statistics[job_name][-1]
+            last_step = last_stat['step']
+            last_loss = last_stat['loss']
+        
+        # Check if config files exist
+        has_config = (job_path / 'job_config.toml').exists()
+        has_dataset = (job_path / 'dataset.toml').exists()
+        
+        overview.append({
+            'job_name': job_name,
+            'status': status,
+            'last_step': last_step,
+            'last_loss': last_loss,
+            'has_config': has_config,
+            'has_dataset': has_dataset
+        })
+    
+    return jsonify({'jobs': overview})
+
+
 @app.route('/api/jobs/<job_name>/config', methods=['GET'])
 def get_job_config(job_name):
     """Get job config TOML content."""
