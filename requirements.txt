@@ -28,3 +28,6 @@ wandb
 optimum-quanto
 wheel
 ninja
+flask
+flask-socketio
+python-socketio
