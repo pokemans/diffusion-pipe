@@ -1157,6 +1157,30 @@ use_venv = ${launchConfig.use_venv}
 
         async function addJobToQueue(jobName) {
             try {
+                // Check if any jobs are running
+                const overviewResponse = await fetch('/api/jobs/overview');
+                if (overviewResponse.ok) {
+                    const overviewData = await overviewResponse.json();
+                    const runningJobs = overviewData.running_jobs || [];
+                    
+                    // If no jobs are running, start the job immediately
+                    if (runningJobs.length === 0) {
+                        const startResponse = await fetch(`/api/jobs/${jobName}/queue/start`, {
+                            method: 'POST'
+                        });
+                        
+                        if (startResponse.ok) {
+                            loadJobsOverview();
+                            return;
+                        } else {
+                            const error = await startResponse.json();
+                            alert('Error starting job: ' + error.error);
+                            return;
+                        }
+                    }
+                }
+                
+                // Otherwise, add to queue
                 const response = await fetch(`/api/jobs/${jobName}/queue/add`, {
                     method: 'POST'
                 });
@@ -1168,7 +1192,7 @@ use_venv = ${launchConfig.use_venv}
                     alert('Error adding job to queue: ' + error.error);
                 }
             } catch (error) {
-                alert('Error adding job to queue: ' + error.message);
+                alert('Error: ' + error.message);
             }
         }
 
