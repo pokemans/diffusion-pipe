@@ -73,6 +73,8 @@
                     <button id="launchBtn" class="launch-btn">Launch Job</button>
                     <button id="stopBtn" class="stop-btn hidden">Stop Job</button>
                     <span id="jobStatus" class="status"></span>
+                    <span id="jobSteps" class="status-info"></span>
+                    <span id="jobETA" class="status-info"></span>
                 </div>
 
                 <div class="monitor-grid">
@@ -140,6 +142,22 @@
         };
         let overviewRefreshInterval = null;
         let lossChart = null;
+
+        // Helper function to format ETA seconds into human-readable format
+        function formatETA(seconds) {
+            if (!seconds || seconds < 0) return 'N/A';
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            
+            if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            } else if (minutes > 0) {
+                return `${minutes}m ${secs}s`;
+            } else {
+                return `${secs}s`;
+            }
+        }
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -355,14 +373,14 @@
                 tbody.innerHTML = data.jobs.map(job => {
                     const statusClass = `status-badge ${job.status}`;
                     const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
-                    const lastStep = job.last_step !== null ? job.last_step : '-';
+                    const stepDisplay = job.step_display || (job.last_step !== null ? job.last_step.toString() : '-');
                     const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
                     
                     return `
                         <tr class="job-row" data-job="${job.job_name}">
                             <td class="job-name-cell">${job.job_name}</td>
                             <td><span class="${statusClass}">${statusText}</span></td>
-                            <td>${lastStep}</td>
+                            <td>${stepDisplay}</td>
                             <td>${lastLoss}</td>
                         </tr>
                     `;
@@ -624,16 +642,55 @@
                     document.getElementById('jobStatus').textContent = 'Status: Stopped';
                     document.getElementById('jobStatus').className = 'status stopped';
                 }
+                
+                // Update steps display
+                const stepsElement = document.getElementById('jobSteps');
+                const etaElement = document.getElementById('jobETA');
+                if (status.statistics && status.statistics.length > 0) {
+                    const lastStat = status.statistics[status.statistics.length - 1];
+                    const currentStep = lastStat.step;
+                    const totalSteps = lastStat.total_steps || status.total_steps;
+                    if (totalSteps) {
+                        stepsElement.textContent = `Steps: ${currentStep}/${totalSteps}`;
+                    } else {
+                        stepsElement.textContent = `Steps: ${currentStep}/?`;
+                    }
+                    
+                    // Update ETA
+                    if (lastStat.eta_seconds) {
+                        etaElement.textContent = `ETA: ${formatETA(lastStat.eta_seconds)}`;
+                    } else {
+                        etaElement.textContent = 'ETA: N/A';
+                    }
+                } else {
+                    stepsElement.textContent = '';
+                    etaElement.textContent = '';
+                }
 
                 // Update plot with existing statistics
                 if (status.statistics && status.statistics.length > 0) {
                     // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:555',message:'before overwriting raw data',data:{oldRawStepsLength:lossData.rawSteps.length,newStatsLength:status.statistics.length,firstStep:status.statistics[0]?.step,lastStep:status.statistics[status.statistics.length-1]?.step},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'A'})}).catch(()=>{});
+                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:555',message:'before merging statistics',data:{oldRawStepsLength:lossData.rawSteps.length,newStatsLength:status.statistics.length,firstStep:status.statistics[0]?.step,lastStep:status.statistics[status.statistics.length-1]?.step},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'A'})}).catch(()=>{});
                     // #endregion
-                    lossData.rawSteps = status.statistics.map(s => s.step);
-                    lossData.rawLosses = status.statistics.map(s => s.loss);
+                    
+                    // Merge statistics instead of overwriting - preserve WebSocket-accumulated data
+                    const existingSteps = new Set(lossData.rawSteps);
+                    const newStats = status.statistics.filter(s => !existingSteps.has(s.step));
+                    
+                    // Append new statistics that aren't already present
+                    newStats.forEach(stat => {
+                        lossData.rawSteps.push(stat.step);
+                        lossData.rawLosses.push(stat.loss);
+                    });
+                    
+                    // If we have no existing data, use all statistics from API
+                    if (lossData.rawSteps.length === 0) {
+                        lossData.rawSteps = status.statistics.map(s => s.step);
+                        lossData.rawLosses = status.statistics.map(s => s.loss);
+                    }
+                    
                     // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:558',message:'after overwriting raw data',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,plotSettings:JSON.stringify(plotSettings)},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'B'})}).catch(()=>{});
+                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:558',message:'after merging statistics',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,newStatsAdded:newStats.length,plotSettings:JSON.stringify(plotSettings)},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix2',hypothesisId:'B'})}).catch(()=>{});
                     // #endregion
                     applyPlotSettings();
                     updatePlot();
@@ -684,6 +741,21 @@
                 // #endregion
                 lossData.rawSteps.push(stats.step);
                 lossData.rawLosses.push(stats.loss);
+                
+                // Update steps and ETA display
+                const stepsElement = document.getElementById('jobSteps');
+                const etaElement = document.getElementById('jobETA');
+                if (stats.total_steps) {
+                    stepsElement.textContent = `Steps: ${stats.step}/${stats.total_steps}`;
+                } else {
+                    stepsElement.textContent = `Steps: ${stats.step}/?`;
+                }
+                if (stats.eta_seconds) {
+                    etaElement.textContent = `ETA: ${formatETA(stats.eta_seconds)}`;
+                } else {
+                    etaElement.textContent = 'ETA: N/A';
+                }
+                
                 // #region agent log
                 fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:520',message:'after adding statistics',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
                 // #endregion
