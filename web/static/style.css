@@ -372,9 +372,21 @@ button {
 }
 
 #jobsOverview h2 {
-    margin-bottom: 15px;
+    margin-bottom: 20px;
     color: #2c3e50;
     font-size: 20px;
+}
+
+#jobsOverview h3 {
+    margin-top: 30px;
+    margin-bottom: 15px;
+    color: #2c3e50;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+#jobsOverview h3:first-of-type {
+    margin-top: 0;
 }
 
 .overview-table {
@@ -446,6 +458,112 @@ button {
     color: #6c757d;
     font-style: italic;
     padding: 30px !important;
+}
+
+/* Action Buttons */
+.action-buttons {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+}
+
+.action-btn {
+    padding: 4px 8px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    background-color: #f8f9fa;
+    color: #495057;
+    transition: all 0.2s;
+    min-width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.action-btn:hover:not(:disabled) {
+    background-color: #e9ecef;
+    transform: scale(1.1);
+}
+
+.action-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.action-btn span {
+    display: inline-block;
+    line-height: 1;
+}
+
+.start-btn {
+    background-color: #d4edda;
+    color: #155724;
+}
+
+.start-btn:hover:not(:disabled) {
+    background-color: #c3e6cb;
+}
+
+.stop-btn {
+    background-color: #f8d7da;
+    color: #721c24;
+}
+
+.stop-btn:hover:not(:disabled) {
+    background-color: #f5c6cb;
+}
+
+.move-up-btn, .move-down-btn {
+    background-color: #d1ecf1;
+    color: #0c5460;
+}
+
+.move-up-btn:hover:not(:disabled), .move-down-btn:hover:not(:disabled) {
+    background-color: #bee5eb;
+}
+
+.remove-btn {
+    background-color: #fff3cd;
+    color: #856404;
+}
+
+.remove-btn:hover:not(:disabled) {
+    background-color: #ffeaa7;
+}
+
+.view-btn {
+    background-color: #e2e3e5;
+    color: #383d41;
+}
+
+.view-btn:hover:not(:disabled) {
+    background-color: #d6d8db;
+}
+
+/* Queue Position */
+.queue-position {
+    font-weight: 600;
+    color: #007bff;
+    text-align: center;
+    min-width: 50px;
+}
+
+/* Responsive adjustments for action buttons */
+@media (max-width: 1200px) {
+    .action-buttons {
+        flex-wrap: wrap;
+        gap: 3px;
+    }
+    
+    .action-btn {
+        min-width: 24px;
+        height: 24px;
+        font-size: 12px;
+        padding: 2px 6px;
+    }
 }
 
 /* Responsive */

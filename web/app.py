@@ -23,6 +23,8 @@ job_statistics = defaultdict(list)
 job_logs = defaultdict(list)
 # Store job metadata (steps_per_epoch, epochs, total_steps, gradient_accumulation_steps, iter_times, last_step_time)
 job_metadata = defaultdict(dict)
+# Store job queue (ordered list of job names waiting to run)
+job_queue = []
 
 # Memory management constants
 MAX_LOG_LINES = 10000
@@ -47,6 +49,29 @@ def ensure_job_dir(job_name):
     job_path = get_job_path(job_name)
     job_path.mkdir(parents=True, exist_ok=True)
     return job_path
+
+
+def has_running_jobs():
+    """Check if any jobs are currently running."""
+    for job_name, process in list(active_jobs.items()):
+        if process.poll() is None:
+            return True
+    return False
+
+
+def start_next_queued_job():
+    """Start the next job in the queue if nothing is running."""
+    if has_running_jobs():
+        return None
+    
+    if not job_queue:
+        return None
+    
+    next_job = job_queue.pop(0)
+    process, error = _launch_job_internal(next_job)
+    if error:
+        return None
+    return next_job
 
 
 def prune_logs(job_name):
@@ -222,6 +247,11 @@ def stream_job_output(job_name, process):
         if job_name in active_jobs:
             del active_jobs[job_name]
         socketio.emit('job_finished', {'job_name': job_name}, room=job_name)
+        
+        # Auto-start next queued job
+        next_job = start_next_queued_job()
+        if next_job:
+            socketio.emit('job_started', {'job_name': next_job}, broadcast=True)
 
 
 @app.route('/')
@@ -242,57 +272,106 @@ def list_jobs():
 
 @app.route('/api/jobs/overview', methods=['GET'])
 def get_jobs_overview():
-    """Get overview data for all jobs."""
+    """Get overview data for all jobs, separated into running and queued lists."""
     if not JOBS_DIR.exists():
-        return jsonify({'jobs': []})
+        return jsonify({'running_jobs': [], 'queued_jobs': []})
     
-    overview = []
+    running_jobs = []
+    queued_jobs = []
+    stopped_jobs = []
+    
     jobs = [d.name for d in JOBS_DIR.iterdir() if d.is_dir()]
     
     for job_name in sorted(jobs):
         job_path = get_job_path(job_name)
         
         # Determine status
+        is_running = False
         if job_name in active_jobs:
             process = active_jobs[job_name]
             if process.poll() is None:
                 status = "running"
+                is_running = True
             else:
                 status = "finished"
+        elif job_name in job_queue:
+            status = "queued"
         else:
             status = "stopped"
         
-        # Get last statistics
+        # Get statistics
         last_step = None
         last_loss = None
         step_display = None
+        eta_seconds = None
+        avg_iter_time = None
+        
+        metadata = job_metadata.get(job_name, {})
+        
         if job_name in job_statistics and job_statistics[job_name]:
             last_stat = job_statistics[job_name][-1]
             last_step = last_stat['step']
             last_loss = last_stat['loss']
             
             # Format step display as "current/total" or "current/?"
-            total_steps = last_stat.get('total_steps') or job_metadata.get(job_name, {}).get('total_steps')
+            total_steps = last_stat.get('total_steps') or metadata.get('total_steps')
             if total_steps:
                 step_display = f"{last_step}/{total_steps}"
             else:
                 step_display = f"{last_step}/?"
+            
+            # Get ETA if available
+            eta_seconds = last_stat.get('eta_seconds')
+            if not eta_seconds and total_steps:
+                # Calculate ETA if not in stat
+                iter_times = metadata.get('iter_times', [])
+                if len(iter_times) >= ITER_TIME_MIN_SAMPLES:
+                    avg_iter_time = calculate_smoothed_iter_time(iter_times)
+                    steps_per_iter = metadata.get('gradient_accumulation_steps', 1)
+                    remaining_steps = total_steps - last_step
+                    if remaining_steps > 0 and steps_per_iter > 0:
+                        eta_seconds = (remaining_steps / steps_per_iter) * avg_iter_time
+        
+        # Calculate average iter time if not already calculated
+        if avg_iter_time is None:
+            iter_times = metadata.get('iter_times', [])
+            if iter_times:
+                avg_iter_time = calculate_smoothed_iter_time(iter_times)
         
         # Check if config files exist
         has_config = (job_path / 'job_config.toml').exists()
         has_dataset = (job_path / 'dataset.toml').exists()
         
-        overview.append({
+        job_data = {
             'job_name': job_name,
             'status': status,
             'last_step': last_step,
             'step_display': step_display,
             'last_loss': last_loss,
+            'eta_seconds': eta_seconds,
+            'avg_iter_time': avg_iter_time,
             'has_config': has_config,
-            'has_dataset': has_dataset
-        })
+            'has_dataset': has_dataset,
+            'total_steps': metadata.get('total_steps'),
+            'steps_per_epoch': metadata.get('steps_per_epoch'),
+            'epochs': metadata.get('epochs'),
+            'gradient_accumulation_steps': metadata.get('gradient_accumulation_steps')
+        }
+        
+        if is_running:
+            running_jobs.append(job_data)
+        elif job_name in job_queue:
+            queue_position = job_queue.index(job_name) + 1
+            job_data['queue_position'] = queue_position
+            queued_jobs.append(job_data)
+        else:
+            stopped_jobs.append(job_data)
     
-    return jsonify({'jobs': overview})
+    return jsonify({
+        'running_jobs': running_jobs,
+        'queued_jobs': queued_jobs,
+        'stopped_jobs': stopped_jobs
+    })
 
 
 @app.route('/api/jobs/<job_name>/config', methods=['GET'])
@@ -392,16 +471,12 @@ def get_job_status(job_name):
     return jsonify(status)
 
 
-@app.route('/api/jobs/<job_name>/launch', methods=['POST'])
-def launch_job(job_name):
-    """Launch a training job."""
-    if job_name in active_jobs:
-        return jsonify({'error': 'Job is already running'}), 400
-    
+def _launch_job_internal(job_name):
+    """Internal function to launch a job (used by launch endpoint and queue system)."""
     # Check if config files exist
     job_config = get_job_path(job_name) / 'job_config.toml'
     if not job_config.exists():
-        return jsonify({'error': 'Job config file not found'}), 404
+        return None, 'Job config file not found'
     
     # Clear previous statistics and logs (but keep metadata like steps_per_epoch)
     job_statistics[job_name] = []
@@ -424,8 +499,7 @@ def launch_job(job_name):
             # Calculate total_steps if we already have steps_per_epoch
             if 'steps_per_epoch' in job_metadata[job_name] and 'epochs' in job_metadata[job_name]:
                 job_metadata[job_name]['total_steps'] = job_metadata[job_name]['steps_per_epoch'] * job_metadata[job_name]['epochs']
-    except Exception as e:
-        # If config reading fails, continue anyway - we'll try to parse from logs
+    except Exception:
         pass
     
     try:
@@ -447,7 +521,6 @@ def launch_job(job_name):
         if venv_activate:
             cmd_str = f'source {venv_activate} && NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 deepspeed --num_gpus=1 train.py --deepspeed --config {config_path}'
         else:
-            # Try without venv activation (might be using system Python)
             cmd_str = f'NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 deepspeed --num_gpus=1 train.py --deepspeed --config {config_path}'
         
         # Launch process with new process group so we can kill all children
@@ -461,8 +534,8 @@ def launch_job(job_name):
             universal_newlines=True,
             bufsize=1,
             cwd=str(PROJECT_ROOT),
-            env=dict(os.environ),  # Pass current environment
-            preexec_fn=preexec_fn  # Create new process group
+            env=dict(os.environ),
+            preexec_fn=preexec_fn
         )
         
         active_jobs[job_name] = process
@@ -471,9 +544,41 @@ def launch_job(job_name):
         thread = threading.Thread(target=stream_job_output, args=(job_name, process), daemon=True)
         thread.start()
         
-        return jsonify({'success': True, 'message': 'Job launched'})
+        return process, None
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return None, str(e)
+
+
+@app.route('/api/jobs/<job_name>/launch', methods=['POST'])
+def launch_job(job_name):
+    """Launch a training job. If jobs are running, add to queue instead."""
+    if job_name in active_jobs:
+        process = active_jobs[job_name]
+        if process.poll() is None:
+            return jsonify({'error': 'Job is already running'}), 400
+    
+    # Remove from queue if present
+    if job_name in job_queue:
+        job_queue.remove(job_name)
+    
+    # Check if any jobs are running
+    if has_running_jobs():
+        # Add to queue
+        if job_name not in job_queue:
+            job_queue.append(job_name)
+        queue_position = job_queue.index(job_name) + 1
+        return jsonify({
+            'success': True,
+            'message': 'Job added to queue',
+            'queued': True,
+            'queue_position': queue_position
+        })
+    else:
+        # Start immediately
+        process, error = _launch_job_internal(job_name)
+        if error:
+            return jsonify({'error': error}), 500
+        return jsonify({'success': True, 'message': 'Job launched', 'queued': False})
 
 
 @app.route('/api/jobs/<job_name>/stop', methods=['POST'])
@@ -524,6 +629,99 @@ def get_job_logs(job_name):
     """Get all logs for a job."""
     logs = job_logs.get(job_name, [])
     return jsonify({'logs': logs})
+
+
+@app.route('/api/jobs/<job_name>/queue/add', methods=['POST'])
+def add_to_queue(job_name):
+    """Explicitly add a job to the queue."""
+    if job_name in active_jobs:
+        process = active_jobs[job_name]
+        if process.poll() is None:
+            return jsonify({'error': 'Job is already running'}), 400
+    
+    if job_name not in job_queue:
+        job_queue.append(job_name)
+    
+    queue_position = job_queue.index(job_name) + 1
+    return jsonify({
+        'success': True,
+        'message': 'Job added to queue',
+        'queue_position': queue_position
+    })
+
+
+@app.route('/api/jobs/<job_name>/queue/move_up', methods=['POST'])
+def move_up_in_queue(job_name):
+    """Move a job up in the queue."""
+    if job_name not in job_queue:
+        return jsonify({'error': 'Job is not in queue'}), 400
+    
+    current_index = job_queue.index(job_name)
+    if current_index == 0:
+        return jsonify({'error': 'Job is already at the top of the queue'}), 400
+    
+    # Swap with previous job
+    job_queue[current_index], job_queue[current_index - 1] = job_queue[current_index - 1], job_queue[current_index]
+    
+    return jsonify({
+        'success': True,
+        'message': 'Job moved up in queue',
+        'queue_position': current_index  # New position (0-indexed, but we return 1-indexed)
+    })
+
+
+@app.route('/api/jobs/<job_name>/queue/move_down', methods=['POST'])
+def move_down_in_queue(job_name):
+    """Move a job down in the queue."""
+    if job_name not in job_queue:
+        return jsonify({'error': 'Job is not in queue'}), 400
+    
+    current_index = job_queue.index(job_name)
+    if current_index == len(job_queue) - 1:
+        return jsonify({'error': 'Job is already at the bottom of the queue'}), 400
+    
+    # Swap with next job
+    job_queue[current_index], job_queue[current_index + 1] = job_queue[current_index + 1], job_queue[current_index]
+    
+    return jsonify({
+        'success': True,
+        'message': 'Job moved down in queue',
+        'queue_position': current_index + 2  # New position (1-indexed)
+    })
+
+
+@app.route('/api/jobs/<job_name>/queue/remove', methods=['POST'])
+def remove_from_queue(job_name):
+    """Remove a job from the queue."""
+    if job_name not in job_queue:
+        return jsonify({'error': 'Job is not in queue'}), 400
+    
+    job_queue.remove(job_name)
+    return jsonify({'success': True, 'message': 'Job removed from queue'})
+
+
+@app.route('/api/jobs/<job_name>/queue/start', methods=['POST'])
+def start_job_from_queue(job_name):
+    """Start a job immediately, removing it from queue if present."""
+    if job_name in active_jobs:
+        process = active_jobs[job_name]
+        if process.poll() is None:
+            return jsonify({'error': 'Job is already running'}), 400
+    
+    # Remove from queue if present
+    if job_name in job_queue:
+        job_queue.remove(job_name)
+    
+    # Check if any jobs are running
+    if has_running_jobs():
+        return jsonify({'error': 'Cannot start job: other jobs are running'}), 400
+    
+    # Start the job
+    process, error = _launch_job_internal(job_name)
+    if error:
+        return jsonify({'error': error}), 500
+    
+    return jsonify({'success': True, 'message': 'Job started'})
 
 
 @socketio.on('connect')

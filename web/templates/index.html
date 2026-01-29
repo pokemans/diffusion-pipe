@@ -24,21 +24,51 @@
 
         <div id="jobsOverview">
             <h2>Jobs Overview</h2>
-            <table class="overview-table">
-                <thead>
-                    <tr>
-                        <th>Job Name</th>
-                        <th>Status</th>
-                        <th>Last Step</th>
-                        <th>Last Loss</th>
-                    </tr>
-                </thead>
-                <tbody id="overviewTableBody">
-                    <tr>
-                        <td colspan="4" class="empty-state">Loading jobs...</td>
-                    </tr>
-                </tbody>
-            </table>
+            
+            <div id="runningJobsSection">
+                <h3>Running Jobs</h3>
+                <table class="overview-table">
+                    <thead>
+                        <tr>
+                            <th>Job Name</th>
+                            <th>Status</th>
+                            <th>Step</th>
+                            <th>Loss</th>
+                            <th>ETA</th>
+                            <th>Iter Time</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="runningJobsTableBody">
+                        <tr>
+                            <td colspan="7" class="empty-state">Loading jobs...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <div id="queuedJobsSection">
+                <h3>Queued Jobs</h3>
+                <table class="overview-table">
+                    <thead>
+                        <tr>
+                            <th>Queue</th>
+                            <th>Job Name</th>
+                            <th>Status</th>
+                            <th>Step</th>
+                            <th>Loss</th>
+                            <th>ETA</th>
+                            <th>Iter Time</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="queuedJobsTableBody">
+                        <tr>
+                            <td colspan="8" class="empty-state">No jobs in queue</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <div id="jobContent" class="hidden">
@@ -143,21 +173,6 @@
         let overviewRefreshInterval = null;
         let lossChart = null;
 
-        // Helper function to format ETA seconds into human-readable format
-        function formatETA(seconds) {
-            if (!seconds || seconds < 0) return 'N/A';
-            const hours = Math.floor(seconds / 3600);
-            const minutes = Math.floor((seconds % 3600) / 60);
-            const secs = Math.floor(seconds % 60);
-            
-            if (hours > 0) {
-                return `${hours}h ${minutes}m`;
-            } else if (minutes > 0) {
-                return `${minutes}m ${secs}s`;
-            } else {
-                return `${secs}s`;
-            }
-        }
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -359,46 +374,132 @@
             }
         }
 
+        function formatETA(seconds) {
+            if (!seconds || seconds < 0) return 'N/A';
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            
+            if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            } else if (minutes > 0) {
+                return `${minutes}m ${secs}s`;
+            } else {
+                return `${secs}s`;
+            }
+        }
+
+        function formatIterTime(seconds) {
+            if (!seconds || seconds <= 0) return 'N/A';
+            if (seconds < 1) {
+                return `${(seconds * 1000).toFixed(0)}ms`;
+            }
+            return `${seconds.toFixed(2)}s`;
+        }
+
+        function renderRunningJobsTable(jobs) {
+            const tbody = document.getElementById('runningJobsTableBody');
+            
+            if (!jobs || jobs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No jobs running</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = jobs.map(job => {
+                const statusClass = `status-badge ${job.status}`;
+                const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+                const stepDisplay = job.step_display || (job.last_step !== null ? job.last_step.toString() : '-');
+                const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
+                const eta = job.eta_seconds ? formatETA(job.eta_seconds) : 'N/A';
+                const iterTime = formatIterTime(job.avg_iter_time);
+                
+                return `
+                    <tr class="job-row" data-job="${job.job_name}">
+                        <td class="job-name-cell" onclick="viewJob('${job.job_name}')">${job.job_name}</td>
+                        <td><span class="${statusClass}">${statusText}</span></td>
+                        <td>${stepDisplay}</td>
+                        <td>${lastLoss}</td>
+                        <td>${eta}</td>
+                        <td>${iterTime}</td>
+                        <td class="action-buttons">
+                            <button class="action-btn stop-btn" onclick="stopJobFromOverview('${job.job_name}')" title="Stop">
+                                <span>⏹</span>
+                            </button>
+                            <button class="action-btn view-btn" onclick="viewJob('${job.job_name}')" title="View">
+                                <span>👁</span>
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderQueuedJobsTable(jobs) {
+            const tbody = document.getElementById('queuedJobsTableBody');
+            
+            if (!jobs || jobs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No jobs in queue</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = jobs.map(job => {
+                const statusClass = `status-badge ${job.status}`;
+                const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+                const stepDisplay = job.step_display || (job.last_step !== null ? job.last_step.toString() : '-');
+                const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
+                const eta = job.eta_seconds ? formatETA(job.eta_seconds) : 'N/A';
+                const iterTime = formatIterTime(job.avg_iter_time);
+                const queuePos = job.queue_position || '-';
+                const isFirst = queuePos === 1;
+                const isLast = queuePos === jobs.length;
+                
+                return `
+                    <tr class="job-row" data-job="${job.job_name}">
+                        <td class="queue-position">#${queuePos}</td>
+                        <td class="job-name-cell" onclick="viewJob('${job.job_name}')">${job.job_name}</td>
+                        <td><span class="${statusClass}">${statusText}</span></td>
+                        <td>${stepDisplay}</td>
+                        <td>${lastLoss}</td>
+                        <td>${eta}</td>
+                        <td>${iterTime}</td>
+                        <td class="action-buttons">
+                            <button class="action-btn start-btn" onclick="startJobFromQueue('${job.job_name}')" title="Start">
+                                <span>▶</span>
+                            </button>
+                            <button class="action-btn move-up-btn" onclick="moveJobInQueue('${job.job_name}', 'up')" title="Move Up" ${isFirst ? 'disabled' : ''}>
+                                <span>↑</span>
+                            </button>
+                            <button class="action-btn move-down-btn" onclick="moveJobInQueue('${job.job_name}', 'down')" title="Move Down" ${isLast ? 'disabled' : ''}>
+                                <span>↓</span>
+                            </button>
+                            <button class="action-btn remove-btn" onclick="removeFromQueue('${job.job_name}')" title="Remove">
+                                <span>×</span>
+                            </button>
+                            <button class="action-btn view-btn" onclick="viewJob('${job.job_name}')" title="View">
+                                <span>👁</span>
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function viewJob(jobName) {
+            document.getElementById('jobSelect').value = jobName;
+            document.getElementById('jobSelect').dispatchEvent(new Event('change'));
+        }
+
         async function loadJobsOverview() {
             try {
                 const response = await fetch('/api/jobs/overview');
                 const data = await response.json();
-                const tbody = document.getElementById('overviewTableBody');
                 
-                if (!data.jobs || data.jobs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No jobs found</td></tr>';
-                    return;
-                }
-                
-                tbody.innerHTML = data.jobs.map(job => {
-                    const statusClass = `status-badge ${job.status}`;
-                    const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
-                    const stepDisplay = job.step_display || (job.last_step !== null ? job.last_step.toString() : '-');
-                    const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
-                    
-                    return `
-                        <tr class="job-row" data-job="${job.job_name}">
-                            <td class="job-name-cell">${job.job_name}</td>
-                            <td><span class="${statusClass}">${statusText}</span></td>
-                            <td>${stepDisplay}</td>
-                            <td>${lastLoss}</td>
-                        </tr>
-                    `;
-                }).join('');
-                
-                // Add click handlers to job name cells
-                tbody.querySelectorAll('.job-name-cell').forEach(cell => {
-                    cell.style.cursor = 'pointer';
-                    cell.addEventListener('click', (e) => {
-                        const jobName = e.target.closest('.job-row').dataset.job;
-                        document.getElementById('jobSelect').value = jobName;
-                        document.getElementById('jobSelect').dispatchEvent(new Event('change'));
-                    });
-                });
+                renderRunningJobsTable(data.running_jobs || []);
+                renderQueuedJobsTable(data.queued_jobs || []);
             } catch (error) {
                 console.error('Error loading jobs overview:', error);
-                const tbody = document.getElementById('overviewTableBody');
-                tbody.innerHTML = '<tr><td colspan="4" class="empty-state">Error loading overview</td></tr>';
+                document.getElementById('runningJobsTableBody').innerHTML = '<tr><td colspan="7" class="empty-state">Error loading overview</td></tr>';
+                document.getElementById('queuedJobsTableBody').innerHTML = '<tr><td colspan="8" class="empty-state">Error loading overview</td></tr>';
             }
         }
 
@@ -613,6 +714,79 @@
                 }
             } catch (error) {
                 alert('Error stopping job: ' + error.message);
+            }
+        }
+
+        async function stopJobFromOverview(jobName) {
+            try {
+                const response = await fetch(`/api/jobs/${jobName}/stop`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    loadJobsOverview();
+                } else {
+                    const error = await response.json();
+                    alert('Error stopping job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error stopping job: ' + error.message);
+            }
+        }
+
+        async function startJobFromQueue(jobName) {
+            try {
+                const response = await fetch(`/api/jobs/${jobName}/queue/start`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    loadJobsOverview();
+                } else {
+                    const error = await response.json();
+                    alert('Error starting job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error starting job: ' + error.message);
+            }
+        }
+
+        async function moveJobInQueue(jobName, direction) {
+            try {
+                const endpoint = direction === 'up' ? 'move_up' : 'move_down';
+                const response = await fetch(`/api/jobs/${jobName}/queue/${endpoint}`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    loadJobsOverview();
+                } else {
+                    const error = await response.json();
+                    alert('Error moving job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error moving job: ' + error.message);
+            }
+        }
+
+        async function removeFromQueue(jobName) {
+            if (!confirm(`Remove ${jobName} from queue?`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/jobs/${jobName}/queue/remove`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    loadJobsOverview();
+                } else {
+                    const error = await response.json();
+                    alert('Error removing job: ' + error.error);
+                }
+            } catch (error) {
+                alert('Error removing job: ' + error.message);
             }
         }
 
