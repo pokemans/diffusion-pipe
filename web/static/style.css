@@ -263,6 +263,82 @@ button {
     white-space: pre-wrap;
 }
 
+.plot-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    padding: 12px 15px;
+    background-color: #f8f9fa;
+    border-bottom: 1px solid #e9ecef;
+    align-items: center;
+}
+
+.control-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.control-group label {
+    font-size: 13px;
+    font-weight: 500;
+    color: #2c3e50;
+    white-space: nowrap;
+}
+
+.control-group input[type="checkbox"] {
+    margin-right: 4px;
+}
+
+.window-size-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 10px;
+}
+
+.window-size-group label {
+    font-size: 12px;
+}
+
+#windowSizeSlider {
+    width: 100px;
+}
+
+#windowSizeValue {
+    font-size: 12px;
+    font-weight: 600;
+    color: #007bff;
+    min-width: 20px;
+}
+
+.control-group input[type="number"] {
+    width: 80px;
+    padding: 4px 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.small-btn {
+    padding: 4px 12px;
+    font-size: 12px;
+    background-color: #6c757d;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.small-btn:hover {
+    background-color: #5a6268;
+}
+
+#showRawLabel {
+    margin-left: 10px;
+}
+
 .plot {
     flex: 1;
     min-height: 400px;
@@ -385,5 +461,33 @@ button {
     .overview-table th,
     .overview-table td {
         padding: 8px 10px;
+    }
+    
+    .plot-controls {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .control-group {
+        width: 100%;
+        flex-wrap: wrap;
+    }
+}
+
+@media (max-width: 768px) {
+    .plot-controls {
+        padding: 10px;
+    }
+    
+    .control-group {
+        font-size: 12px;
+    }
+    
+    .control-group input[type="number"] {
+        width: 60px;
+    }
+    
+    #windowSizeSlider {
+        width: 80px;
     }
 }
