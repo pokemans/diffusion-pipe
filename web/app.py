@@ -71,6 +71,74 @@ def ensure_job_dir(job_name):
     return job_path
 
 
+def validate_job_name(job_name):
+    """Validate job name format."""
+    if not job_name or not job_name.strip():
+        return False, "Job name cannot be empty"
+    if '..' in job_name or '/' in job_name or '\\' in job_name:
+        return False, "Job name cannot contain path separators"
+    if job_name.strip() != job_name:
+        return False, "Job name cannot have leading/trailing whitespace"
+    return True, None
+
+
+def copy_job(source_job_name, new_job_name):
+    """Copy a job to a new job name with find/replace in config files."""
+    # Validate source job exists
+    source_path = get_job_path(source_job_name)
+    if not source_path.exists():
+        return False, f"Source job '{source_job_name}' does not exist"
+    
+    # Validate new job name
+    valid, error = validate_job_name(new_job_name)
+    if not valid:
+        return False, error
+    
+    # Check if new job already exists
+    new_path = get_job_path(new_job_name)
+    if new_path.exists():
+        return False, f"Job '{new_job_name}' already exists"
+    
+    # Check if source has required config file
+    source_config = source_path / 'job_config.toml'
+    if not source_config.exists():
+        return False, f"Source job '{source_job_name}' does not have job_config.toml"
+    
+    try:
+        # Create new job directory
+        ensure_job_dir(new_job_name)
+        
+        # Copy job_config.toml with find/replace
+        source_config_content = source_config.read_text()
+        # Replace all occurrences of old job name with new job name
+        # Handle patterns like: jobs/job1/ -> jobs/new_job/
+        # and: jobs/job1 -> jobs/new_job (without trailing slash)
+        modified_config = source_config_content.replace(f'jobs/{source_job_name}/', f'jobs/{new_job_name}/')
+        modified_config = modified_config.replace(f'jobs/{source_job_name}"', f'jobs/{new_job_name}"')
+        modified_config = modified_config.replace(f'jobs/{source_job_name}\'', f'jobs/{new_job_name}\'')
+        modified_config = modified_config.replace(f'jobs/{source_job_name}', f'jobs/{new_job_name}')
+        
+        new_config_path = new_path / 'job_config.toml'
+        new_config_path.write_text(modified_config)
+        
+        # Copy dataset.toml if it exists
+        source_dataset = source_path / 'dataset.toml'
+        if source_dataset.exists():
+            source_dataset_content = source_dataset.read_text()
+            # Apply same find/replace for dataset.toml
+            modified_dataset = source_dataset_content.replace(f'jobs/{source_job_name}/', f'jobs/{new_job_name}/')
+            modified_dataset = modified_dataset.replace(f'jobs/{source_job_name}"', f'jobs/{new_job_name}"')
+            modified_dataset = modified_dataset.replace(f'jobs/{source_job_name}\'', f'jobs/{new_job_name}\'')
+            modified_dataset = modified_dataset.replace(f'jobs/{source_job_name}', f'jobs/{new_job_name}')
+            
+            new_dataset_path = new_path / 'dataset.toml'
+            new_dataset_path.write_text(modified_dataset)
+        
+        return True, None
+    except Exception as e:
+        return False, f"Error copying job: {str(e)}"
+
+
 def init_nvml():
     """Initialize NVIDIA Management Library."""
     global nvml_initialized, nvml_gpu_handle, nvml_gpu_name
@@ -863,6 +931,25 @@ def start_job_from_queue(job_name):
         return jsonify({'error': error}), 500
     
     return jsonify({'success': True, 'message': 'Job started'})
+
+
+@app.route('/api/jobs/<job_name>/copy', methods=['POST'])
+def copy_job_endpoint(job_name):
+    """Copy a job to a new job name."""
+    try:
+        data = request.get_json()
+        new_job_name = data.get('new_job_name', '').strip()
+        
+        if not new_job_name:
+            return jsonify({'error': 'New job name is required'}), 400
+        
+        success, error = copy_job(job_name, new_job_name)
+        if success:
+            return jsonify({'success': True, 'message': f'Job copied to {new_job_name}'})
+        else:
+            return jsonify({'error': error}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @socketio.on('connect')
