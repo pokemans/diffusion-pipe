@@ -34,16 +34,15 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 active_jobs = {}
 # Store statistics per job
 job_statistics = defaultdict(list)
-# Store log buffers per job
-job_logs = defaultdict(list)
+# Store log buffers per job (1000 lines max for WebSocket streaming)
+job_log_buffers = defaultdict(list)
 # Store job metadata (steps_per_epoch, epochs, total_steps, gradient_accumulation_steps, iter_times, last_step_time)
 job_metadata = defaultdict(dict)
 # Store job queue (ordered list of job names waiting to run)
 job_queue = []
 
-# Memory management constants
-MAX_LOG_LINES = 10000
-PRUNE_THRESHOLD_MULTIPLIER = 1.2
+# Log buffer size (for WebSocket streaming)
+LOG_BUFFER_SIZE = 1000
 
 # Iter time smoothing constants
 ITER_TIME_WINDOW_SIZE = 30  # Number of iter times to keep for moving average
@@ -73,6 +72,38 @@ def ensure_job_dir(job_name):
     job_path = get_job_path(job_name)
     job_path.mkdir(parents=True, exist_ok=True)
     return job_path
+
+
+def get_job_log_path(job_name):
+    """Get the path to a job's log file."""
+    return get_job_path(job_name) / 'output.log'
+
+
+def append_log_to_file(job_name, line):
+    """Thread-safe append log line to file."""
+    log_path = get_job_log_path(job_name)
+    try:
+        # Open in append mode (creates file if doesn't exist)
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception as e:
+        # Log error but don't crash - continue operation
+        print(f"Error writing log to file for job {job_name}: {e}")
+
+
+def read_last_n_lines_from_file(file_path, n):
+    """Read last n lines from a file efficiently."""
+    if not file_path.exists():
+        return []
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            # Return last n lines, removing trailing newlines
+            return [line.rstrip('\n\r') for line in lines[-n:]]
+    except Exception as e:
+        print(f"Error reading log file {file_path}: {e}")
+        return []
 
 
 def validate_job_name(job_name):
@@ -191,6 +222,15 @@ def get_system_stats():
             memory_total_gb = memory_info.total / (1024 ** 3)
             memory_percent = (memory_info.used / memory_info.total) * 100 if memory_info.total > 0 else 0
             
+            # Get power consumption (in milliwatts, convert to watts)
+            power_watts = None
+            try:
+                power_mw = pynvml.nvmlDeviceGetPowerUsage(nvml_gpu_handle)
+                power_watts = round(power_mw / 1000.0, 1)
+            except Exception:
+                # Power monitoring may not be available on all GPUs
+                pass
+            
             stats['gpu'] = {
                 'available': True,
                 'name': nvml_gpu_name,
@@ -198,7 +238,8 @@ def get_system_stats():
                 'memory_used_gb': round(memory_used_gb, 1),
                 'memory_total_gb': round(memory_total_gb, 1),
                 'memory_percent': round(memory_percent, 1),
-                'temperature': temperature
+                'temperature': temperature,
+                'power_watts': power_watts
             }
         except Exception as e:
             print(f"Error getting GPU stats: {e}")
@@ -282,14 +323,17 @@ def start_next_queued_job():
     return next_job
 
 
-def prune_logs(job_name):
-    """Prune log buffer if it exceeds threshold."""
-    if job_name not in job_logs:
-        return
-    logs_list = job_logs[job_name]
-    threshold = int(MAX_LOG_LINES * PRUNE_THRESHOLD_MULTIPLIER)
-    if len(logs_list) > threshold:
-        job_logs[job_name] = logs_list[-MAX_LOG_LINES:]
+def maintain_log_buffer(job_name, line):
+    """Add line to buffer and maintain max size."""
+    if job_name not in job_log_buffers:
+        job_log_buffers[job_name] = []
+    
+    buffer = job_log_buffers[job_name]
+    buffer.append(line)
+    
+    # Keep only last LOG_BUFFER_SIZE lines
+    if len(buffer) > LOG_BUFFER_SIZE:
+        buffer.pop(0)
 
 
 def calculate_smoothed_iter_time(iter_times):
@@ -422,7 +466,7 @@ def parse_log_line(line, job_name):
 
 
 def stream_job_output(job_name, process):
-    """Stream job output via WebSocket."""
+    """Stream job output via WebSocket and write to disk."""
     try:
         # Read from stdout (stderr is redirected to stdout)
         while True:
@@ -435,10 +479,11 @@ def stream_job_output(job_name, process):
             
             line = line.rstrip()
             if line:
-                # Store log line
-                job_logs[job_name].append(line)
-                # Prune logs if they exceed threshold
-                prune_logs(job_name)
+                # Append to disk file
+                append_log_to_file(job_name, line)
+                
+                # Add to in-memory buffer (for WebSocket streaming)
+                maintain_log_buffer(job_name, line)
                 
                 # Emit log line via WebSocket
                 socketio.emit('log_line', {'line': line}, room=job_name)
@@ -449,7 +494,9 @@ def stream_job_output(job_name, process):
                     job_statistics[job_name].append(stats)
                     socketio.emit('statistics', {'stats': stats}, room=job_name)
     except Exception as e:
-        socketio.emit('log_line', {'line': f'[ERROR] {str(e)}'}, room=job_name)
+        error_msg = f'[ERROR] {str(e)}'
+        append_log_to_file(job_name, error_msg)
+        socketio.emit('log_line', {'line': error_msg}, room=job_name)
     finally:
         # Job finished
         if job_name in active_jobs:
@@ -683,10 +730,20 @@ def get_job_status(job_name):
                 if remaining_steps > 0 and steps_per_iter > 0:
                     stat['eta_seconds'] = (remaining_steps / steps_per_iter) * avg_iter_time
     
+    # Count total lines in log file
+    log_path = get_job_log_path(job_name)
+    log_count = 0
+    if log_path.exists():
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                log_count = sum(1 for _ in f)
+        except Exception:
+            pass
+    
     status = {
         'running': is_running,
         'statistics': statistics,
-        'log_count': len(job_logs.get(job_name, [])),
+        'log_count': log_count,
         'total_steps': total_steps
     }
     
@@ -806,7 +863,17 @@ def _launch_job_internal(job_name):
     
     # Clear previous statistics and logs (but keep metadata like steps_per_epoch)
     job_statistics[job_name] = []
-    job_logs[job_name] = []
+    job_log_buffers[job_name] = []
+    
+    # Initialize/truncate log file
+    log_path = get_job_log_path(job_name)
+    try:
+        ensure_job_dir(job_name)
+        # Truncate existing log file or create new one
+        log_path.write_text('')
+    except Exception as e:
+        print(f"Error initializing log file for job {job_name}: {e}")
+    
     # Reset step tracking for iter time calculation
     if job_name in job_metadata:
         job_metadata[job_name].pop('last_step', None)
@@ -941,8 +1008,8 @@ def stop_job(job_name):
 
 @app.route('/api/jobs/<job_name>/logs', methods=['GET'])
 def get_job_logs(job_name):
-    """Get logs for a job. Returns most recent N lines (default 500)."""
-    logs = job_logs.get(job_name, [])
+    """Get logs for a job. Returns most recent N lines (default 500) from disk file."""
+    log_path = get_job_log_path(job_name)
     
     # Get number of lines from query parameter, default to 500
     try:
@@ -951,12 +1018,21 @@ def get_job_logs(job_name):
     except (ValueError, TypeError):
         num_lines = 500
     
-    # Return most recent N lines
-    recent_logs = logs[-num_lines:] if len(logs) > num_lines else logs
+    # Read last n lines from disk file
+    recent_logs = read_last_n_lines_from_file(log_path, num_lines)
+    
+    # Count total lines in file for total_lines
+    total_lines = 0
+    if log_path.exists():
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                total_lines = sum(1 for _ in f)
+        except Exception:
+            pass
     
     return jsonify({
         'logs': recent_logs,
-        'total_lines': len(logs),
+        'total_lines': total_lines,
         'returned_lines': len(recent_logs)
     })
 
@@ -1093,9 +1169,9 @@ def handle_subscribe_logs(data):
         join_room(job_name)
         emit('subscribed', {'job_name': job_name})
         
-        # Send existing logs
-        if job_name in job_logs:
-            for line in job_logs[job_name][-1000:]:  # Last 1000 lines
+        # Send existing logs from buffer (last 1000 lines)
+        if job_name in job_log_buffers:
+            for line in job_log_buffers[job_name]:
                 emit('log_line', {'line': line})
 
 
