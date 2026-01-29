@@ -1594,27 +1594,27 @@ use_venv = ${launchConfig.use_venv}
             // CPU Stats
             if (data.cpu && Object.keys(data.cpu).length > 0) {
                 const cpu = data.cpu;
-                stats.push(`<span class="stat-item"><span class="stat-icon">⚙️</span><span class="stat-label">CPU:</span><span class="stat-value">${cpu.percent}%</span></span>`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🧠</span><span class="stat-value">${cpu.percent}%</span></span>`);
             }
 
             // GPU Stats
             if (data.gpu && data.gpu.available) {
                 const gpu = data.gpu;
                 stats.push(`<span class="stat-item"><span class="stat-icon">🖥️</span><span class="stat-value">${gpu.utilization}%</span></span>`);
-                stats.push(`<span class="stat-item"><span class="stat-icon">💾</span><span class="stat-value">${gpu.memory_used_gb}/${gpu.memory_total_gb} GB</span></span>`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🏃</span><span class="stat-value">${gpu.memory_used_gb}/${gpu.memory_total_gb} GB</span></span>`);
                 stats.push(`<span class="stat-item"><span class="stat-icon">🌡️</span><span class="stat-value">${gpu.temperature}°C</span></span>`);
             }
 
             // Memory Stats
             if (data.memory && Object.keys(data.memory).length > 0) {
                 const mem = data.memory;
-                stats.push(`<span class="stat-item"><span class="stat-icon">🧠</span><span class="stat-value">${mem.used_gb}/${mem.total_gb} GB</span></span>`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🚶</span><span class="stat-value">${mem.used_gb}/${mem.total_gb} GB</span></span>`);
             }
 
             // Swap Stats
             if (data.swap && Object.keys(data.swap).length > 0 && data.swap.total_gb > 0) {
                 const swap = data.swap;
-                stats.push(`<span class="stat-item"><span class="stat-icon">💿</span><span class="stat-value">${swap.used_gb}/${swap.total_gb} GB</span></span>`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🧑‍🦯</span><span class="stat-value">${swap.used_gb}/${swap.total_gb} GB</span></span>`);
             }
 
             if (stats.length === 0) {
