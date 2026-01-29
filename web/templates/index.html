@@ -94,13 +94,13 @@
 
         <div id="jobContent" class="hidden">
             <div class="tabs">
-                <button class="tab-btn" data-tab="config">Job Config</button>
+                <button class="tab-btn active" data-tab="config">Job Config</button>
                 <button class="tab-btn" data-tab="dataset">Dataset Config</button>
                 <button class="tab-btn" data-tab="launch">Launch Options</button>
-                <button class="tab-btn active" data-tab="monitor">Monitor</button>
+                <button class="tab-btn" data-tab="monitor">Monitor</button>
             </div>
 
-            <div class="tab-content" id="configTab">
+            <div class="tab-content active" id="configTab">
                 <div class="editor-container">
                     <div class="editor-header">
                         <h3>Job Config (job_config.toml)</h3>
@@ -149,7 +149,7 @@
                 </div>
             </div>
 
-            <div class="tab-content active" id="monitorTab">
+            <div class="tab-content" id="monitorTab">
                 <div class="controls">
                     <button id="launchBtn" class="launch-btn">Launch Job</button>
                     <button id="stopBtn" class="stop-btn hidden">Stop Job</button>
@@ -690,6 +690,22 @@
 
                 // Connect to WebSocket
                 connectWebSocket(jobName);
+
+                // Determine default tab based on job status
+                const statusResponse = await fetch(`/api/jobs/${jobName}/status`);
+                if (statusResponse.ok) {
+                    const statusData = await statusResponse.json();
+                    if (statusData.running) {
+                        // Job is running - show monitor tab
+                        switchTab('monitor');
+                    } else {
+                        // Job is not running - show config tab
+                        switchTab('config');
+                    }
+                } else {
+                    // Default to config tab if status check fails
+                    switchTab('config');
+                }
 
                 // Show content
                 document.getElementById('jobContent').classList.remove('hidden');
@@ -1573,38 +1589,38 @@ use_venv = ${launchConfig.use_venv}
             const container = document.getElementById('systemStats');
             if (!container) return;
 
-            const parts = [];
+            const stats = [];
 
             // CPU Stats
             if (data.cpu && Object.keys(data.cpu).length > 0) {
                 const cpu = data.cpu;
-                parts.push(`⚙️ CPU: ${cpu.percent}%`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">⚙️</span><span class="stat-label">CPU:</span><span class="stat-value">${cpu.percent}%</span></span>`);
             }
 
             // GPU Stats
             if (data.gpu && data.gpu.available) {
                 const gpu = data.gpu;
-                parts.push(`🖥️ ${gpu.utilization}%`);
-                parts.push(`💾 ${gpu.memory_used_gb}/${gpu.memory_total_gb} GB`);
-                parts.push(`🌡️ ${gpu.temperature}°C`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🖥️</span><span class="stat-value">${gpu.utilization}%</span></span>`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">💾</span><span class="stat-value">${gpu.memory_used_gb}/${gpu.memory_total_gb} GB</span></span>`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🌡️</span><span class="stat-value">${gpu.temperature}°C</span></span>`);
             }
 
             // Memory Stats
             if (data.memory && Object.keys(data.memory).length > 0) {
                 const mem = data.memory;
-                parts.push(`🧠 ${mem.used_gb}/${mem.total_gb} GB`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">🧠</span><span class="stat-value">${mem.used_gb}/${mem.total_gb} GB</span></span>`);
             }
 
             // Swap Stats
             if (data.swap && Object.keys(data.swap).length > 0 && data.swap.total_gb > 0) {
                 const swap = data.swap;
-                parts.push(`💿 ${swap.used_gb}/${swap.total_gb} GB`);
+                stats.push(`<span class="stat-item"><span class="stat-icon">💿</span><span class="stat-value">${swap.used_gb}/${swap.total_gb} GB</span></span>`);
             }
 
-            if (parts.length === 0) {
+            if (stats.length === 0) {
                 container.innerHTML = '<span class="stats-unavailable">Stats unavailable</span>';
             } else {
-                container.innerHTML = parts.join(' | ');
+                container.innerHTML = stats.join('<span class="stat-separator">|</span>');
             }
         }
 
