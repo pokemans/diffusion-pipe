@@ -85,7 +85,12 @@ def init_nvml():
         pynvml.nvmlInit()
         # Get handle for first GPU (index 0)
         nvml_gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        nvml_gpu_name = pynvml.nvmlDeviceGetName(nvml_gpu_handle).decode('utf-8')
+        gpu_name = pynvml.nvmlDeviceGetName(nvml_gpu_handle)
+        # Handle both bytes and string returns (different pynvml versions)
+        if isinstance(gpu_name, bytes):
+            nvml_gpu_name = gpu_name.decode('utf-8')
+        else:
+            nvml_gpu_name = str(gpu_name)
         nvml_initialized = True
         return True
     except Exception as e:
