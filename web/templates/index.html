@@ -760,8 +760,16 @@
             }
             
             // #region agent log
-            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:710',message:'before Plotly.react',data:{tracesLength:traces.length,hasMainTrace:lossData.steps.length>0,hasRawTrace:plotSettings.showRaw&&plotSettings.movingAverage&&lossData.rawSteps.length>0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+            fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:710',message:'before Plotly.react',data:{tracesLength:traces.length,hasMainTrace:lossData.steps.length>0,hasRawTrace:plotSettings.showRaw&&plotSettings.movingAverage&&lossData.rawSteps.length>0},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'C'})}).catch(()=>{});
             // #endregion
+
+            // Don't update plot if there are no traces - this prevents clearing an existing plot
+            if (traces.length === 0) {
+                // #region agent log
+                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:714',message:'skipping Plotly.react - no traces',data:{tracesLength:traces.length,rawStepsLength:lossData.rawSteps.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'C'})}).catch(()=>{});
+                // #endregion
+                return;
+            }
 
             const layout = {
                 title: 'Training Loss',
@@ -775,11 +783,11 @@
             try {
                 Plotly.react('lossPlot', traces, layout, { responsive: true });
                 // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:723',message:'Plotly.react success',data:{tracesLength:traces.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:728',message:'Plotly.react success',data:{tracesLength:traces.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'C'})}).catch(()=>{});
                 // #endregion
             } catch (error) {
                 // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:726',message:'Plotly.react error',data:{error:error.message,tracesLength:traces.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:731',message:'Plotly.react error',data:{error:error.message,tracesLength:traces.length},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'C'})}).catch(()=>{});
                 // #endregion
                 console.error('Plotly.react error:', error);
             }
