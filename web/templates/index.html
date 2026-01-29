@@ -560,19 +560,24 @@
                 // Update plot with existing statistics
                 if (status.statistics && status.statistics.length > 0) {
                     // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:555',message:'before overwriting raw data',data:{oldRawStepsLength:lossData.rawSteps.length,newStatsLength:status.statistics.length,firstStep:status.statistics[0]?.step,lastStep:status.statistics[status.statistics.length-1]?.step},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:555',message:'before overwriting raw data',data:{oldRawStepsLength:lossData.rawSteps.length,newStatsLength:status.statistics.length,firstStep:status.statistics[0]?.step,lastStep:status.statistics[status.statistics.length-1]?.step},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'A'})}).catch(()=>{});
                     // #endregion
                     lossData.rawSteps = status.statistics.map(s => s.step);
                     lossData.rawLosses = status.statistics.map(s => s.loss);
                     // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:558',message:'after overwriting raw data',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,plotSettings:JSON.stringify(plotSettings)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:558',message:'after overwriting raw data',data:{rawStepsLength:lossData.rawSteps.length,rawLossesLength:lossData.rawLosses.length,plotSettings:JSON.stringify(plotSettings)},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'B'})}).catch(()=>{});
                     // #endregion
                     applyPlotSettings();
                     updatePlot();
                 } else {
                     // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:562',message:'no statistics in status',data:{hasStatistics:!!status.statistics,statisticsLength:status.statistics?.length||0,rawStepsLength:lossData.rawSteps.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+                    fetch('http://127.0.0.1:7242/ingest/e751b283-9917-439e-b940-0a7eca19244e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'index.html:562',message:'no statistics in status - preserving existing data',data:{hasStatistics:!!status.statistics,statisticsLength:status.statistics?.length||0,rawStepsLength:lossData.rawSteps.length,willUpdatePlot:lossData.rawSteps.length>0},timestamp:Date.now(),sessionId:'debug-session',runId:'post-fix',hypothesisId:'A'})}).catch(()=>{});
                     // #endregion
+                    // Don't overwrite existing data if statistics are empty - only update plot if we have existing data
+                    if (lossData.rawSteps.length > 0) {
+                        applyPlotSettings();
+                        updatePlot();
+                    }
                 }
             } catch (error) {
                 // #region agent log
