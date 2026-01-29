@@ -286,9 +286,104 @@ button {
     background: #666;
 }
 
+/* Jobs Overview */
+#jobsOverview {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    margin-bottom: 20px;
+}
+
+#jobsOverview h2 {
+    margin-bottom: 15px;
+    color: #2c3e50;
+    font-size: 20px;
+}
+
+.overview-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.overview-table thead {
+    background-color: #f8f9fa;
+    border-bottom: 2px solid #e9ecef;
+}
+
+.overview-table th {
+    padding: 12px 15px;
+    text-align: left;
+    font-weight: 600;
+    color: #2c3e50;
+}
+
+.overview-table td {
+    padding: 12px 15px;
+    border-bottom: 1px solid #e9ecef;
+}
+
+.overview-table tbody tr:hover {
+    background-color: #f8f9fa;
+    cursor: pointer;
+}
+
+.overview-table tbody tr.job-row:hover {
+    background-color: #e7f3ff;
+}
+
+.job-name-cell {
+    font-weight: 500;
+    color: #007bff;
+}
+
+.job-name-cell:hover {
+    text-decoration: underline;
+}
+
+.status-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.status-badge.running {
+    background-color: #d4edda;
+    color: #155724;
+}
+
+.status-badge.stopped {
+    background-color: #f8d7da;
+    color: #721c24;
+}
+
+.status-badge.finished {
+    background-color: #d1ecf1;
+    color: #0c5460;
+}
+
+.empty-state {
+    text-align: center;
+    color: #6c757d;
+    font-style: italic;
+    padding: 30px !important;
+}
+
 /* Responsive */
 @media (max-width: 1200px) {
     .monitor-grid {
         grid-template-columns: 1fr;
+    }
+    
+    .overview-table {
+        font-size: 12px;
+    }
+    
+    .overview-table th,
+    .overview-table td {
+        padding: 8px 10px;
     }
 }

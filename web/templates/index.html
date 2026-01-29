@@ -21,6 +21,25 @@
             </div>
         </header>
 
+        <div id="jobsOverview">
+            <h2>Jobs Overview</h2>
+            <table class="overview-table">
+                <thead>
+                    <tr>
+                        <th>Job Name</th>
+                        <th>Status</th>
+                        <th>Last Step</th>
+                        <th>Last Loss</th>
+                    </tr>
+                </thead>
+                <tbody id="overviewTableBody">
+                    <tr>
+                        <td colspan="4" class="empty-state">Loading jobs...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
         <div id="jobContent" class="hidden">
             <div class="tabs">
                 <button class="tab-btn active" data-tab="config">Job Config</button>
@@ -79,11 +98,14 @@
         let socket = null;
         let currentJob = null;
         let lossData = { steps: [], losses: [] };
+        let overviewRefreshInterval = null;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             loadJobs();
+            loadJobsOverview();
             setupEventListeners();
+            startOverviewRefresh();
         });
 
         function setupEventListeners() {
@@ -92,8 +114,10 @@
                 const jobName = e.target.value;
                 if (jobName) {
                     loadJob(jobName);
+                    hideOverview();
                 } else {
                     hideJobContent();
+                    showOverview();
                 }
             });
 
@@ -154,6 +178,75 @@
             }
         }
 
+        async function loadJobsOverview() {
+            try {
+                const response = await fetch('/api/jobs/overview');
+                const data = await response.json();
+                const tbody = document.getElementById('overviewTableBody');
+                
+                if (!data.jobs || data.jobs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No jobs found</td></tr>';
+                    return;
+                }
+                
+                tbody.innerHTML = data.jobs.map(job => {
+                    const statusClass = `status-badge ${job.status}`;
+                    const statusText = job.status.charAt(0).toUpperCase() + job.status.slice(1);
+                    const lastStep = job.last_step !== null ? job.last_step : '-';
+                    const lastLoss = job.last_loss !== null ? job.last_loss.toFixed(4) : '-';
+                    
+                    return `
+                        <tr class="job-row" data-job="${job.job_name}">
+                            <td class="job-name-cell">${job.job_name}</td>
+                            <td><span class="${statusClass}">${statusText}</span></td>
+                            <td>${lastStep}</td>
+                            <td>${lastLoss}</td>
+                        </tr>
+                    `;
+                }).join('');
+                
+                // Add click handlers to job name cells
+                tbody.querySelectorAll('.job-name-cell').forEach(cell => {
+                    cell.style.cursor = 'pointer';
+                    cell.addEventListener('click', (e) => {
+                        const jobName = e.target.closest('.job-row').dataset.job;
+                        document.getElementById('jobSelect').value = jobName;
+                        document.getElementById('jobSelect').dispatchEvent(new Event('change'));
+                    });
+                });
+            } catch (error) {
+                console.error('Error loading jobs overview:', error);
+                const tbody = document.getElementById('overviewTableBody');
+                tbody.innerHTML = '<tr><td colspan="4" class="empty-state">Error loading overview</td></tr>';
+            }
+        }
+
+        function showOverview() {
+            document.getElementById('jobsOverview').classList.remove('hidden');
+            startOverviewRefresh();
+        }
+
+        function hideOverview() {
+            document.getElementById('jobsOverview').classList.add('hidden');
+            stopOverviewRefresh();
+        }
+
+        function startOverviewRefresh() {
+            stopOverviewRefresh();
+            overviewRefreshInterval = setInterval(() => {
+                if (!currentJob) {
+                    loadJobsOverview();
+                }
+            }, 3000);
+        }
+
+        function stopOverviewRefresh() {
+            if (overviewRefreshInterval) {
+                clearInterval(overviewRefreshInterval);
+                overviewRefreshInterval = null;
+            }
+        }
+
         async function createJob(jobName) {
             try {
                 // Create empty config files
@@ -170,6 +263,7 @@
                 });
 
                 await loadJobs();
+                await loadJobsOverview();
                 document.getElementById('jobSelect').value = jobName;
                 loadJob(jobName);
             } catch (error) {
@@ -181,6 +275,7 @@
         async function loadJob(jobName) {
             currentJob = jobName;
             hideJobContent();
+            hideOverview();
 
             try {
                 // Load configs
