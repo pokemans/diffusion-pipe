@@ -871,7 +871,7 @@ class QwenImagePipeline(BasePipeline):
                     t_tensor = t_curr.expand(batch).to(transformer_device, dtype=transformer_dtype)
                     
                     # --- THE TRANSFORMER CALL ---
-model_output = self.transformer(
+                    model_output = self.transformer(
                         hidden_states=latents_seq,
                         encoder_hidden_states=prompt_embeds,
                         timestep=t_tensor,
