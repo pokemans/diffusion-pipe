@@ -815,30 +815,29 @@ class QwenImagePipeline(BasePipeline):
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         images = []
         
-        # Default guidance if None (Qwen usually likes 1.0 or 3.5 depending on the setup)
-        if guidance_scale is None:
-            guidance_scale = 1.0
-            
-        #self.transformer.eval()
-        #self.vae.eval()
+        # Ensure guidance_scale is a float if not provided
+        guidance_val = guidance_scale if guidance_scale is not None else 1.0
+        
+        self.transformer.eval()
+        self.vae.eval()
 
         for prompt in prompts:
-            # --- Cached Embedding Logic ---
-            use_cached = False
+            # --- 1. Handle Cached Embeddings ---
             if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
                 hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
                 if prompt in self.sample_prompts:
                     cached_idx = self.sample_prompts.index(prompt)
+                    # Force to device immediately upon retrieval
                     prompt_embeds = self.sample_prompt_embeds[cached_idx].to(self.device, dtype=self.dtype)
-                    use_cached = True
-                
-            if not use_cached:
-                raise RuntimeError(f'Prompt "{prompt}" not found in cached embeddings.')
+                else:
+                    raise RuntimeError(f'Prompt "{prompt}" not found in cache.')
+            else:
+                raise RuntimeError("No cached embeddings found. Call cache_sample_prompts() first.")
 
             generator = torch.Generator(device=self.device).manual_seed(seed)
             
             with torch.no_grad():                
-                # 1. Prepare Latents (Ensure device/dtype at creation)
+                # --- 2. Prepare Latents ---
                 in_channels = self.transformer.config.in_channels
                 latents = torch.randn(
                     (1, in_channels, height // 8, width // 8),
@@ -847,26 +846,30 @@ class QwenImagePipeline(BasePipeline):
                     dtype=self.dtype
                 )
 
-                # 2. Flatten and Force Device
+                # --- 3. Prepare Sequence and Shapes ---
                 batch, channels, h, w = latents.shape
-                # We explicitly call .to(self.device) here to resolve the RuntimeError
+                # Flatten and EXPLICITLY move to device
                 latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(self.device, dtype=self.dtype)
                 
+                # RoPE shapes: Qwen2-VL based models usually need (h, w, 1)
                 img_shapes = [(h, w, 1)]
 
-                # 3. Sampling Loop
+                # --- 4. Flow Matching Loop ---
+                # timesteps 1.0 -> 0.0
                 timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
 
-                for i in tqdm(range(num_inference_steps), desc=f"Sampling {prompt[:15]}..."):
+                for i in tqdm(range(num_inference_steps), desc=f"Generating"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
                     
-                    # Convert t to the range/dtype the model expects (usually 0-1000 for Long)
-                    t_tensor = (t_curr * 1000).expand(batch).to(self.device, dtype=torch.long)
+                    # Convert t to tensor on device. 
+                    # Note: If output is black/static, try: t_tensor = (t_curr * 1000).expand(batch)...
+                    t_tensor = t_curr.expand(batch).to(self.device, dtype=self.dtype)
                     
-                    # Ensure guidance tensor is on device
-                    g_tensor = torch.full((batch,), guidance_scale, device=self.device, dtype=self.dtype)
+                    # Guidance tensor on device
+                    g_tensor = torch.full((batch,), guidance_val, device=self.device, dtype=self.dtype)
 
+                    # --- THE TRANSFORMER CALL ---
                     model_output = self.transformer(
                         hidden_states=latents_seq,
                         encoder_hidden_states=prompt_embeds,
@@ -880,13 +883,15 @@ class QwenImagePipeline(BasePipeline):
                     dt = t_next - t_curr
                     latents_seq = latents_seq + model_output * dt
 
-                # 4. Reshape back for VAE
+                # --- 5. Reconstruction ---
+                # Sequence back to Spatial
                 latents = latents_seq.permute(0, 2, 1).view(batch, channels, h, w)
 
-                # 5. Decode and Post-Process
+                # VAE Decode
                 latents = latents / self.vae.config.scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
                 
+                # Convert to PIL
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).float().numpy()
                 pil_image = Image.fromarray((image[0] * 255).astype("uint8"))
