@@ -178,6 +178,7 @@ class QwenImagePipeline(BasePipeline):
     name = 'qwen_image'
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['QwenImageTransformerBlock']
+    pixels_round_to_multiple = 32
 
     prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
     prompt_template_encode_start_idx = 34
@@ -912,8 +913,10 @@ class QwenImagePipeline(BasePipeline):
             # Apply VAE normalization reversal
             final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
             
-            # VAE expects (bs, c, f, h, w) format - keep frame dimension even for single images (num_frames=1)
-            # The VAE can handle num_frames=1 for single image generation
+            # Qwen VAE expects (bs, c, h, w) format for single images, not (bs, c, f, h, w)
+            # Squeeze frame dimension if num_frames == 1
+            if final_latents.ndim == 5 and final_latents.shape[2] == 1:
+                final_latents = final_latents.squeeze(2)  # (bs, c, 1, h, w) -> (bs, c, h, w)
             
             # Decode
             decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
@@ -936,22 +939,46 @@ class QwenImagePipeline(BasePipeline):
                     pass  # Ignore errors during cleanup
         
         # Handle frame dimension in decoded tensor before indexing
-        # VAE output format: [B, C, F, H, W] where F=1 for single images
-        # Squeeze frame dimension if present (dimension 2, index 2)
-        if decoded.ndim == 5 and decoded.shape[2] == 1:
-            decoded = decoded.squeeze(2)  # [B, C, F, H, W] -> [B, C, H, W] when F=1
+        # VAE output format: [B, C, H, W] for images (frame dimension already squeezed before decode)
+        # But check for 5D output just in case
+        if decoded.ndim == 5:
+            if decoded.shape[2] == 1:
+                decoded = decoded.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+            else:
+                raise ValueError(f"Unexpected decoded tensor shape: {decoded.shape}, expected 4D [B, C, H, W] or 5D [B, C, 1, H, W]")
+        
+        # Validate decoded tensor shape
+        if decoded.ndim != 4:
+            raise ValueError(f"Decoded tensor must be 4D [B, C, H, W], got shape: {decoded.shape}")
+        if decoded.shape[1] != 3:
+            raise ValueError(f"Decoded tensor must have 3 channels (RGB), got {decoded.shape[1]} channels")
         
         # Convert to PIL images
         images = []
         for i in range(len(prompts)):
-            img = decoded[i]  # Already on CPU and float
+            img = decoded[i]  # Shape: [C, H, W]
+            
+            # Ensure tensor is float32 and on CPU
+            if not img.is_floating_point():
+                img = img.float()
+            if img.device != torch.device('cpu'):
+                img = img.cpu()
+            
             # VAE output is in range [-1, 1], convert to [0, 1]
             img = (img + 1) / 2
             img = img.clamp(0, 1)
+            
             # Ensure we have 3D tensor [C, H, W] for PIL conversion
             if img.ndim != 3:
-                # If still not 3D (shouldn't happen after frame squeeze), try squeezing size-1 dims
+                # If still not 3D, try squeezing size-1 dims
                 img = img.squeeze()
+                if img.ndim != 3:
+                    raise ValueError(f"Image tensor must be 3D [C, H, W] after processing, got shape: {img.shape}")
+            
+            # Validate tensor values are in valid range for PIL
+            if img.min() < 0 or img.max() > 1:
+                img = img.clamp(0, 1)
+            
             # Convert to PIL
             pil_img = torchvision.transforms.functional.to_pil_image(img)
             images.append(pil_img)
