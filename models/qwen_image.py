@@ -870,19 +870,15 @@ class QwenImagePipeline(BasePipeline):
                     # Convert t to tensor on transformer's device
                     t_tensor = t_curr.expand(batch).to(transformer_device, dtype=transformer_dtype)
                     
-                    # Guidance tensor on transformer's device
-                    g_tensor = torch.full((batch,), guidance_val, device=transformer_device, dtype=transformer_dtype)
-
                     # --- THE TRANSFORMER CALL ---
-                    model_output = self.transformer(
+model_output = self.transformer(
                         hidden_states=latents_seq,
                         encoder_hidden_states=prompt_embeds,
                         timestep=t_tensor,
                         img_shapes=img_shapes,
-                        guidance=g_tensor,
+                        guidance=torch.full((batch,), guidance_val, device=transformer_device, dtype=transformer_dtype),
                         return_dict=False
                     )[0]
-
                     # Euler Step
                     dt = t_next - t_curr
                     latents_seq = latents_seq + model_output * dt
