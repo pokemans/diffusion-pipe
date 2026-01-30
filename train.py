@@ -139,6 +139,7 @@ def set_config_defaults(config):
     config.setdefault('compile', False)
     config.setdefault('x_axis_examples', False)
     config.setdefault('text_encoder_cache_on_cpu', False)
+    config.setdefault('text_encoder_blocks_to_swap', 0)
 
     # Sample generation config
     if 'sample_generation' in config:
@@ -244,6 +245,7 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         return
     empty_cuda_cache()
     model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
+    model.prepare_text_encoder_block_swap_inference(disable_block_swap=disable_block_swap)
     with torch.no_grad(), isolate_rng():
         seed = get_rank()
         random.seed(seed)
@@ -252,6 +254,7 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
     empty_cuda_cache()
     model.prepare_block_swap_training()
+    model.prepare_text_encoder_block_swap_training()
 
 
 def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writer, disable_block_swap):
@@ -265,6 +268,7 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
     
     empty_cuda_cache()
     model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
+    model.prepare_text_encoder_block_swap_inference(disable_block_swap=disable_block_swap)
     
     try:
         with torch.no_grad(), isolate_rng():
@@ -321,6 +325,7 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
     finally:
         empty_cuda_cache()
         model.prepare_block_swap_training()
+        model.prepare_text_encoder_block_swap_training()
 
 
 def distributed_init(args):
@@ -581,6 +586,16 @@ if __name__ == '__main__':
         quit()
 
     dataset_manager.cache()
+    
+    # Cache sample generation prompts if configured
+    sample_gen_config = config.get('sample_generation', {})
+    if sample_gen_config.get('enabled', False) and 'prompts' in sample_gen_config:
+        if hasattr(model, 'cache_sample_prompts'):
+            prompts = sample_gen_config['prompts']
+            model.cache_sample_prompts(prompts)
+            if is_main_process():
+                print(f"Cached {len(prompts)} sample generation prompts")
+    
     if args.cache_only:
         quit()
 
@@ -637,6 +652,13 @@ if __name__ == '__main__':
             pass
         deepspeed.pipe.PipelineModule.to = to
         model.enable_block_swap(blocks_to_swap)
+    
+    # Text encoder block swapping
+    text_encoder_blocks_to_swap = config.get('text_encoder_blocks_to_swap', 0)
+    if text_encoder_blocks_to_swap > 0:
+        assert config['pipeline_stages'] == 1, 'Text encoder block swapping only works with pipeline_stages=1'
+        assert 'adapter' in config, 'Text encoder block swapping only works when training LoRA'
+        model.enable_text_encoder_block_swap(text_encoder_blocks_to_swap)
 
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}

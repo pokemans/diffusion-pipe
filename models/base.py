@@ -288,6 +288,15 @@ class BasePipeline:
     def prepare_block_swap_inference(self, disable_block_swap=False):
         pass
 
+    def enable_text_encoder_block_swap(self, text_encoder_blocks_to_swap):
+        raise NotImplementedError('Text encoder block swapping is not implemented for this model')
+
+    def prepare_text_encoder_block_swap_training(self):
+        pass
+
+    def prepare_text_encoder_block_swap_inference(self, disable_block_swap=False):
+        pass
+
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         """
         Generate sample images from text prompts.
@@ -626,6 +635,15 @@ class ComfyPipeline:
         pass
 
     def prepare_block_swap_inference(self, disable_block_swap=False):
+        pass
+
+    def enable_text_encoder_block_swap(self, text_encoder_blocks_to_swap):
+        raise NotImplementedError('Text encoder block swapping is not implemented for this model')
+
+    def prepare_text_encoder_block_swap_training(self):
+        pass
+
+    def prepare_text_encoder_block_swap_inference(self, disable_block_swap=False):
         pass
 
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):

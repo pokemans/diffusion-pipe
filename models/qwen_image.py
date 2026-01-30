@@ -191,6 +191,9 @@ class QwenImagePipeline(BasePipeline):
         self.config = config
         self.model_config = self.config['model']
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.text_encoder_offloader = None
+        self.sample_prompt_embeds = None
+        self.sample_prompts = None
         dtype = self.model_config['dtype']
 
         self.preprocess_media_file_fn = PreprocessMediaFile(self.config, support_video=True, framerate=1)
@@ -281,6 +284,66 @@ class QwenImagePipeline(BasePipeline):
     def get_text_encoders(self):
         return [self.text_encoder]
 
+    def cache_sample_prompts(self, prompts):
+        """Cache text embeddings for sample generation prompts."""
+        if prompts is None or len(prompts) == 0:
+            return
+        
+        # Encode prompts using the same method as dataset caching
+        prompt_embeds = self._get_qwen_prompt_embeds(prompts, control_files=None, device=self.text_encoder.device)
+        
+        # Store prompts and their embeddings
+        self.sample_prompts = prompts
+        self.sample_prompt_embeds = prompt_embeds
+
+    def enable_text_encoder_block_swap(self, text_encoder_blocks_to_swap):
+        if text_encoder_blocks_to_swap == 0:
+            return
+        
+        # Extract layers from Qwen text encoder
+        # Structure: text_encoder.model.language_model.model.layers
+        text_encoder = self.text_encoder
+        if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
+            language_model = text_encoder.model.language_model
+            if hasattr(language_model, 'model') and hasattr(language_model.model, 'layers'):
+                layers = language_model.model.layers
+            else:
+                raise ValueError('Could not find layers in Qwen text encoder at expected path')
+        else:
+            raise ValueError('Could not find language_model in Qwen text encoder')
+        
+        num_layers = len(layers)
+        assert (
+            text_encoder_blocks_to_swap <= num_layers - 2
+        ), f'Cannot swap more than {num_layers - 2} text encoder blocks. Requested {text_encoder_blocks_to_swap} blocks to swap.'
+        
+        self.text_encoder_offloader = ModelOffloader(
+            'TextEncoderBlock', layers, num_layers, text_encoder_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
+        )
+        
+        # Temporarily detach layers to prevent automatic GPU movement
+        language_model.model.layers = None
+        # Move text encoder structure to GPU (but layers will be managed separately)
+        text_encoder.to('cuda')
+        # Reattach layers
+        language_model.model.layers = layers
+        
+        self.prepare_text_encoder_block_swap_training()
+        print(f'Text encoder block swap enabled. Swapping {text_encoder_blocks_to_swap} blocks out of {num_layers} blocks.')
+
+    def prepare_text_encoder_block_swap_training(self):
+        if self.text_encoder_offloader is not None:
+            self.text_encoder_offloader.enable_block_swap()
+            self.text_encoder_offloader.set_forward_only(False)
+            self.text_encoder_offloader.prepare_block_devices_before_forward()
+
+    def prepare_text_encoder_block_swap_inference(self, disable_block_swap=False):
+        if self.text_encoder_offloader is not None:
+            if disable_block_swap:
+                self.text_encoder_offloader.disable_block_swap()
+            self.text_encoder_offloader.set_forward_only(True)
+            self.text_encoder_offloader.prepare_block_devices_before_forward()
+
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
         # ComfyUI format.
@@ -337,6 +400,9 @@ class QwenImagePipeline(BasePipeline):
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
+        # Check if text encoder block swapping is enabled
+        use_block_swap = self.text_encoder_offloader is not None and self.text_encoder_offloader.blocks_to_swap is not None and self.text_encoder_offloader.blocks_to_swap > 0
+
         if control_files is None:
             template = self.prompt_template_encode
             drop_idx = self.prompt_template_encode_start_idx
@@ -345,11 +411,20 @@ class QwenImagePipeline(BasePipeline):
                 txt, max_length=self.tokenizer_max_length + drop_idx, padding=True, truncation=True, return_tensors="pt"
             ).to(device)
             attention_mask = txt_tokens.attention_mask
-            outputs = self.text_encoder(
-                input_ids=txt_tokens.input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
+            
+            if use_block_swap:
+                # Manual forward pass with block swapping
+                outputs = self._text_encoder_forward_with_block_swap(
+                    input_ids=txt_tokens.input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+            else:
+                outputs = self.text_encoder(
+                    input_ids=txt_tokens.input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
         else:
             template = self.prompt_template_encode_edit
             drop_idx = self.prompt_template_encode_start_idx_edit
@@ -365,19 +440,87 @@ class QwenImagePipeline(BasePipeline):
                 return_tensors="pt",
             ).to(device)
             attention_mask = model_inputs.attention_mask
-            outputs = self.text_encoder(
-                input_ids=model_inputs.input_ids,
-                attention_mask=attention_mask,
-                pixel_values=model_inputs.pixel_values,
-                image_grid_thw=model_inputs.image_grid_thw,
-                output_hidden_states=True,
-            )
+            
+            if use_block_swap:
+                # Manual forward pass with block swapping
+                outputs = self._text_encoder_forward_with_block_swap(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                )
+            else:
+                outputs = self.text_encoder(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                )
 
         hidden_states = outputs.hidden_states[-1]
         split_hidden_states = self._extract_masked_hidden(hidden_states, attention_mask)
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
 
         return split_hidden_states
+
+    def _text_encoder_forward_with_block_swap(self, input_ids, attention_mask, pixel_values=None, image_grid_thw=None, output_hidden_states=False):
+        """Manual forward pass through text encoder with block swapping."""
+        text_encoder = self.text_encoder
+        language_model = text_encoder.model.language_model
+        model = language_model.model
+        layers = model.layers
+        
+        # Get embeddings
+        inputs_embeds = model.embed_tokens(input_ids)
+        
+        # Process vision inputs if present (for edit mode)
+        if pixel_values is not None:
+            vision_outputs = text_encoder.visual.forward(pixel_values, image_grid_thw)
+            vision_hidden_states = vision_outputs.last_hidden_state
+            # Combine text and vision embeddings
+            # This is a simplified version - actual Qwen implementation may differ
+            inputs_embeds = torch.cat([vision_hidden_states, inputs_embeds], dim=1)
+            # Update attention mask
+            vision_mask = torch.ones(vision_hidden_states.shape[:2], dtype=attention_mask.dtype, device=attention_mask.device)
+            attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
+        
+        hidden_states = inputs_embeds
+        hidden_states_list = [hidden_states] if output_hidden_states else []
+        
+        # Forward through layers with block swapping
+        for layer_idx, layer in enumerate(layers):
+            # Wait for block to be on GPU
+            self.text_encoder_offloader.wait_for_block(layer_idx)
+            
+            # Forward through layer
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=None,  # Qwen handles this internally
+            )
+            hidden_states = layer_outputs[0]
+            
+            if output_hidden_states:
+                hidden_states_list.append(hidden_states)
+            
+            # Submit block swap for next iteration
+            self.text_encoder_offloader.submit_move_blocks_forward(layer_idx)
+        
+        # Apply final layer norm
+        hidden_states = model.norm(hidden_states)
+        
+        # Create outputs object similar to transformers output
+        class TextEncoderOutput:
+            def __init__(self, last_hidden_state, hidden_states=None):
+                self.last_hidden_state = last_hidden_state
+                self.hidden_states = hidden_states
+        
+        return TextEncoderOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=tuple(hidden_states_list) if output_hidden_states else None
+        )
 
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(caption, is_video, control_file: list[str] | None):
@@ -386,6 +529,60 @@ class QwenImagePipeline(BasePipeline):
             prompt_embeds = self._get_qwen_prompt_embeds(caption, control_file, device=text_encoder.device)
             return {'prompt_embeds': prompt_embeds}
         return fn
+
+    def _pack_latents(self, latents, bs, num_channels_latents, h, w):
+        """Pack latents from (bs, c, f, h, w) to (bs, seq_len, hidden_dim) sequence format."""
+        # This method should match what the transformer's img_in expects
+        # For now, delegate to transformer if it has the method, otherwise use einops-style packing
+        if hasattr(self.transformer, '_pack_latents'):
+            return self.transformer._pack_latents(latents, bs, num_channels_latents, h, w)
+        
+        # Fallback implementation: pack 2x2 patches
+        # latents shape: (bs, num_channels_latents, num_frames, h, w)
+        # Pack into sequence: (bs, seq_len, hidden_dim) where hidden_dim = num_channels_latents * 4
+        # and seq_len = (h//2) * (w//2) * num_frames
+        
+        bs_actual, c, num_frames, h_spatial, w_spatial = latents.shape
+        assert bs_actual == bs
+        assert c == num_channels_latents
+        
+        # Pack 2x2 patches: (h, w) -> (h//2, w//2) with 4x channels
+        # Reshape to extract 2x2 patches: (bs, c, f, h, w) -> (bs, c, f, h//2, 2, w//2, 2)
+        latents = latents.reshape(bs, c, num_frames, h_spatial // 2, 2, w_spatial // 2, 2)
+        # Permute to group patch elements: (bs, c, f, h//2, w//2, 2, 2)
+        latents = latents.permute(0, 2, 3, 5, 1, 4, 6)  # (bs, f, h//2, w//2, c, 2, 2)
+        # Flatten patch: (bs, f, h//2, w//2, c*4)
+        latents = latents.reshape(bs, num_frames, h_spatial // 2, w_spatial // 2, c * 4)
+        # Flatten spatial and frame: (bs, f*(h//2)*(w//2), c*4)
+        latents = latents.reshape(bs, num_frames * (h_spatial // 2) * (w_spatial // 2), c * 4)
+        
+        return latents
+
+    def _unpack_latents(self, latents, bs, num_channels_latents, h, w):
+        """Unpack latents from (bs, seq_len, hidden_dim) back to (bs, c, f, h, w) spatial format."""
+        # This method should reverse _pack_latents
+        if hasattr(self.transformer, '_unpack_latents'):
+            return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
+        
+        # Fallback implementation: unpack 2x2 patches
+        bs_actual, seq_len, hidden_dim = latents.shape
+        assert bs_actual == bs
+        assert hidden_dim == num_channels_latents * 4
+        
+        # Calculate dimensions
+        # seq_len = num_frames * (h//2) * (w//2)
+        h_spatial = h
+        w_spatial = w
+        num_frames = seq_len // ((h_spatial // 2) * (w_spatial // 2))
+        
+        # Reshape: (bs, seq_len, hidden_dim) -> (bs, f, h//2, w//2, c, 2, 2)
+        latents = latents.reshape(bs, num_frames, h_spatial // 2, w_spatial // 2, num_channels_latents, 2, 2)
+        # Permute back: (bs, f, h//2, w//2, c, 2, 2) -> (bs, c, f, h//2, 2, w//2, 2)
+        latents = latents.permute(0, 4, 1, 2, 5, 3, 6)  # (bs, c, f, h//2, 2, w//2, 2)
+        # Reshape to (bs, c, f, h, w)
+        latents = latents.reshape(bs, num_channels_latents, num_frames, h_spatial, w_spatial)
+        
+        return latents
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
@@ -475,6 +672,156 @@ class QwenImagePipeline(BasePipeline):
             (x_t, prompt_embeds, attention_mask, t, img_shapes, txt_seq_lens) + extra,
             (target, mask),
         )
+
+    def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
+        """
+        Generate sample images from text prompts using flow matching sampling.
+        
+        Args:
+            prompts: List of text prompts
+            num_inference_steps: Number of sampling steps
+            height: Image height in pixels
+            width: Image width in pixels
+            seed: Random seed for reproducibility
+            guidance_scale: Not used for Qwen Image (no CFG)
+            
+        Returns:
+            List of PIL Images
+        """
+        import torchvision
+        from PIL import Image
+        import numpy as np
+        
+        # Set random seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        
+        device = next(self.transformer.parameters()).device
+        dtype = self.model_config['dtype']
+        
+        # Check if we have cached embeddings
+        if self.sample_prompt_embeds is None or self.sample_prompts != prompts:
+            raise RuntimeError('Sample prompt embeddings must be cached before calling generate_samples. Call cache_sample_prompts() during dataset caching.')
+        
+        prompt_embeds = self.sample_prompt_embeds
+        
+        # Format prompt embeds similar to prepare_inputs()
+        attn_mask_list = [torch.ones(e.size(0), dtype=torch.bool, device=device) for e in prompt_embeds]
+        max_seq_len = max([e.size(0) for e in prompt_embeds])
+        prompt_embeds_tensor = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in prompt_embeds]
+        ).to(device, dtype)
+        prompt_embeds_mask = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+        ).to(device)
+        
+        max_text_len = prompt_embeds_mask.sum(dim=1).max().item()
+        prompt_embeds_tensor = prompt_embeds_tensor[:, :max_text_len, :]
+        prompt_embeds_mask = prompt_embeds_mask[:, :max_text_len]
+        
+        # Round height/width to multiple of pixels_round_to_multiple (32 for Qwen Image)
+        height = ((height + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
+        width = ((width + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
+        
+        # Calculate latent dimensions
+        # Qwen Image VAE uses 8x downsampling (standard VAE downsampling)
+        latent_h = height // 8
+        latent_w = width // 8
+        num_channels_latents = self.transformer.config.in_channels // 4
+        num_frames = 1  # Single image, not video
+        
+        bs = len(prompts)
+        
+        # Initialize latents with random noise
+        latents = torch.randn(bs, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
+        
+        # Flow matching sampling: Euler steps from t=1 to t=0
+        dt = 1.0 / num_inference_steps
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        
+        self.transformer.eval()
+        layers = self.to_layers()
+        
+        with torch.no_grad():
+            # Start with pure noise at t=1
+            x_0 = torch.randn_like(latents)  # Noise
+            x_1 = torch.randn_like(latents)  # Will be updated to clean latents
+            
+            for i in range(num_inference_steps):
+                t = timesteps[i]
+                
+                # Create x_t = (1 - t) * x_1 + t * x_0 (interpolation between clean and noise)
+                t_expanded = t.view(-1, 1, 1, 1, 1)
+                x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
+                
+                # Pack latents for transformer
+                x_t_packed = self._pack_latents(x_t, bs, num_channels_latents, latent_h, latent_w)
+                
+                # Prepare inputs for model (same format as prepare_inputs)
+                img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device).repeat((bs, 1, 1))
+                txt_seq_lens = torch.tensor([max_text_len], dtype=torch.int32, device=device).repeat((bs,))
+                img_attention_mask = torch.ones((bs, x_t_packed.shape[1]), dtype=torch.bool, device=device)
+                attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
+                attention_mask = attention_mask.view(bs, 1, 1, -1)
+                
+                t_tensor = t.expand(bs).to(device, dtype)
+                
+                # Forward through model layers
+                model_inputs = (x_t_packed, prompt_embeds_tensor, attention_mask, t_tensor, img_shapes, txt_seq_lens)
+                x = model_inputs
+                for layer in layers:
+                    x = layer(x)
+                
+                # x is the predicted target (x_0 - x_1)
+                predicted_target = x
+                
+                # Unpack predicted target
+                predicted_target_unpacked = self._unpack_latents(predicted_target, bs, num_channels_latents, latent_h, latent_w)
+                
+                # Euler step: move towards clean latents
+                # predicted_target = x_0 - x_1, so to move towards x_1:
+                # x_1_new = x_t - dt * predicted_target
+                # This is equivalent to: x_1_new = x_t - dt * (x_0 - x_1_old)
+                x_1 = x_t - dt * predicted_target_unpacked
+                
+                # For next iteration, update x_0 to current x_1
+                x_0 = x_1.clone()
+        
+        # Final latents are x_1 (clean latents) - already in spatial format (bs, c, f, h, w)
+        final_latents = x_1
+        
+        # Decode with VAE
+        vae = self.get_vae()
+        vae.to(device)
+        
+        # Apply VAE normalization reversal
+        final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
+        
+        # VAE expects (bs, c, f, h, w) format, but for single image we need (bs, c, h, w)
+        # Remove frame dimension: (bs, c, f, h, w) -> (bs, c, h, w)
+        final_latents = final_latents.squeeze(2)  # Remove frame dimension
+        
+        # Decode
+        decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
+        if hasattr(decoded, 'sample'):
+            decoded = decoded.sample
+        elif isinstance(decoded, dict):
+            decoded = decoded['sample']
+        
+        # Convert to PIL images
+        images = []
+        for i in range(len(prompts)):
+            img = decoded[i].cpu().float()
+            # VAE output is in range [-1, 1], convert to [0, 1]
+            img = (img + 1) / 2
+            img = img.clamp(0, 1)
+            # Convert to PIL
+            pil_img = torchvision.transforms.functional.to_pil_image(img)
+            images.append(pil_img)
+        
+        return images
 
     def to_layers(self):
         transformer = self.transformer
