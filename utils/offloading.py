@@ -109,7 +109,10 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     with torch.cuda.stream(stream):
         # cuda to cpu (weights)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-            cuda_data_view.record_stream(stream)
+            # Only record stream if the tensor is actually on CUDA
+            # When swapping blocks that are already on CPU, cuda_data_view might be on CPU
+            if cuda_data_view.device.type == 'cuda':
+                cuda_data_view.record_stream(stream)
             module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
         stream.synchronize()
