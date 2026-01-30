@@ -815,8 +815,8 @@ class QwenImagePipeline(BasePipeline):
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         images = []
         
-        # Ensure guidance_scale is a float if not provided
-        guidance_val = guidance_scale if guidance_scale is not None else 1.0
+        # Note: guidance_scale parameter is accepted for API compatibility but not used
+        # QwenImageTransformer doesn't support guidance/classifier-free guidance
         
         self.transformer.eval()
         self.vae.eval()
@@ -870,20 +870,15 @@ class QwenImagePipeline(BasePipeline):
                     # Qwen-Image FM usually expects 0-1000 float
                     t_tensor = (t_curr * 1000).expand(batch).to(transformer_device, dtype=transformer_dtype)
 
-                    # Use Keywords for everything
-                    kwargs = {
-                        "hidden_states": latents_seq,
-                        "encoder_hidden_states": prompt_embeds,
-                        "timestep": t_tensor,
-                        "img_shapes": img_shapes,
-                        "return_dict": False
-                    }
-                    
-                    # Only add guidance if provided/supported
-                    if guidance_val is not None:
-                        kwargs["guidance"] = torch.full((batch,), guidance_val, device=transformer_device, dtype=transformer_dtype)
-
-                    model_output = self.transformer(**kwargs)[0]
+                    # QwenImageTransformer doesn't support guidance parameter
+                    # The time_text_embed method only accepts timestep and hidden_states
+                    model_output = self.transformer(
+                        hidden_states=latents_seq,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=t_tensor,
+                        img_shapes=img_shapes,
+                        return_dict=False
+                    )[0]
 
                     # Euler Step
                     dt = t_next - t_curr
