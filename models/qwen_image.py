@@ -14,6 +14,7 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 import transformers
 from PIL import Image, ImageOps
+from tqdm import tqdm
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors
