@@ -293,18 +293,37 @@ class QwenImagePipeline(BasePipeline):
         text_encoder = self.text_encoder
         print(f'[DEBUG] enable_text_encoder_block_swap: text_encoder type = {type(text_encoder)}')
         
-        # Qwen structure: model.language_model.model.layers
+        # Qwen structure: Need to find the actual path to layers
+        # Based on key conversion in __init__, it might be model.language_model.layers or model.language_model.model.layers
         layers = None
         try:
-            if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
-                language_model = text_encoder.model.language_model
-                if hasattr(language_model, 'model') and hasattr(language_model.model, 'layers'):
-                    layers = language_model.model.layers
-                    print(f'[DEBUG] Found layers via model.language_model.model.layers: {len(layers) if layers else 0} layers')
+            print(f'[DEBUG] Exploring text_encoder structure...')
+            if hasattr(text_encoder, 'model'):
+                print(f'[DEBUG] text_encoder.model exists: {type(text_encoder.model)}')
+                if hasattr(text_encoder.model, 'language_model'):
+                    language_model = text_encoder.model.language_model
+                    print(f'[DEBUG] language_model exists: {type(language_model)}')
+                    print(f'[DEBUG] language_model attributes: {[attr for attr in dir(language_model) if not attr.startswith("_")][:20]}')
+                    
+                    # Try different possible paths
+                    if hasattr(language_model, 'layers'):
+                        layers = language_model.layers
+                        print(f'[DEBUG] Found layers via model.language_model.layers: {len(layers) if layers else 0} layers')
+                    elif hasattr(language_model, 'model') and hasattr(language_model.model, 'layers'):
+                        layers = language_model.model.layers
+                        print(f'[DEBUG] Found layers via model.language_model.model.layers: {len(layers) if layers else 0} layers')
+                    else:
+                        print(f'[DEBUG] Checking language_model.model attributes...')
+                        if hasattr(language_model, 'model'):
+                            print(f'[DEBUG] language_model.model exists: {type(language_model.model)}')
+                            print(f'[DEBUG] language_model.model attributes: {[attr for attr in dir(language_model.model) if not attr.startswith("_")][:20]}')
+                        print(f'[DEBUG] language_model.layers not found, language_model.model.layers not found')
                 else:
-                    print(f'[DEBUG] language_model.model.layers not found')
+                    print(f'[DEBUG] text_encoder.model.language_model not found')
+                    print(f'[DEBUG] text_encoder.model attributes: {[attr for attr in dir(text_encoder.model) if not attr.startswith("_")][:20]}')
             else:
-                print(f'[DEBUG] text_encoder.model.language_model not found')
+                print(f'[DEBUG] text_encoder.model not found')
+                print(f'[DEBUG] text_encoder attributes: {[attr for attr in dir(text_encoder) if not attr.startswith("_")][:20]}')
         except Exception as e:
             print(f'[ERROR] Exception while finding layers: {e}')
             import traceback
