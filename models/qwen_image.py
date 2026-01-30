@@ -823,12 +823,23 @@ class QwenImagePipeline(BasePipeline):
         self.transformer.eval()
         self.prepare_block_swap_inference(disable_block_swap=False)
         
-        # Encode prompts
-        prompt_embeds_list = self._get_qwen_prompt_embeds(
-            prompts,
-            control_files=None,
-            device=device
-        )
+        # Check if we have cached prompt embeddings
+        if (hasattr(self, 'sample_prompt_embeds') and 
+            self.sample_prompt_embeds is not None and
+            hasattr(self, 'sample_prompts') and
+            self.sample_prompts == prompts):
+            # Use cached embeddings - move to device if needed
+            prompt_embeds_list = [
+                emb.to(device) if isinstance(emb, torch.Tensor) and emb.device != device else emb
+                for emb in self.sample_prompt_embeds
+            ]
+        else:
+            # Encode prompts (cache miss or not cached)
+            prompt_embeds_list = self._get_qwen_prompt_embeds(
+                prompts,
+                control_files=None,
+                device=device
+            )
         
         # Pad prompt embeds to same length (same as prepare_inputs does)
         attn_mask_list = [torch.ones(e.size(0), dtype=torch.bool, device=device) for e in prompt_embeds_list]
