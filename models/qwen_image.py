@@ -825,8 +825,8 @@ class QwenImagePipeline(BasePipeline):
         num_channels_latents = self.transformer.config.in_channels // 4
         
         # Prepare for inference (once, reused for all prompts)
-        self.transformer.eval()
-        self.prepare_block_swap_inference(disable_block_swap=False)
+        #self.transformer.eval()
+        # self.prepare_block_swap_inference(disable_block_swap=False)
 
         vae = self.get_vae()
         vae.eval()
