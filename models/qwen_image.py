@@ -899,48 +899,41 @@ class QwenImagePipeline(BasePipeline):
         final_latents = x_1
         
         # Decode with VAE
+        # Keep VAE on CPU to avoid GPU memory pressure when restoring block swap training state
+        # This is slower (~1-5s vs ~50-200ms) but acceptable since sample generation is infrequent
         vae = self.get_vae()
-        try:
-            # Handle meta tensors before moving to device
-            try:
-                vae.to(device)
-            except NotImplementedError as e:
-                if "meta tensor" in str(e):
-                    # Some parameters/buffers on meta device - manually move them
-                    self._move_meta_tensors_to_device(vae, device)
-                    # Try again after moving meta tensors
-                    vae.to(device)
-                else:
-                    raise
-            
-            # Apply VAE normalization reversal
-            final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
-            
-            # Qwen VAE expects (bs, c, num_frames, h, w) format - keep frame dimension even if it's 1
-            # Ensure final_latents is 5D: (bs, c, num_frames, h, w)
-            if final_latents.ndim == 4:
-                # If somehow we got 4D, add frame dimension
-                final_latents = final_latents.unsqueeze(2)  # (bs, c, h, w) -> (bs, c, 1, h, w)
-            
-            # Decode - VAE expects 5D tensor
-            decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
-            if hasattr(decoded, 'sample'):
-                decoded = decoded.sample
-            elif isinstance(decoded, dict):
-                decoded = decoded['sample']
-            
-            # Move decoded to CPU before processing
-            decoded = decoded.cpu().float()
-            
-            # Move VAE back to CPU to free GPU memory before block swap restoration
+        
+        # Ensure VAE is on CPU (it should already be, but be explicit)
+        vae_device = next(vae.parameters()).device
+        if vae_device.type == 'cuda':
             vae.to('cpu')
-        finally:
-            # Ensure VAE is always moved to CPU, even if exception occurs
-            if vae is not None:
-                try:
-                    vae.to('cpu')
-                except Exception:
-                    pass  # Ignore errors during cleanup
+        
+        # Move latents to CPU first to avoid device mismatch with VAE normalization buffers
+        # VAE buffers (latents_std_tensor, latents_mean_tensor) are on CPU, so final_latents must be too
+        final_latents_cpu = final_latents.cpu()
+        del final_latents  # Free GPU memory immediately
+        
+        # Qwen VAE expects (bs, c, num_frames, h, w) format - keep frame dimension even if it's 1
+        # Ensure final_latents_cpu is 5D: (bs, c, num_frames, h, w)
+        if final_latents_cpu.ndim == 4:
+            # If somehow we got 4D, add frame dimension
+            final_latents_cpu = final_latents_cpu.unsqueeze(2)  # (bs, c, h, w) -> (bs, c, 1, h, w)
+        
+        # Apply VAE normalization reversal (all tensors on CPU now)
+        final_latents_cpu = final_latents_cpu * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
+        
+        # Decode on CPU - VAE expects 5D tensor
+        decoded = vae.decode(final_latents_cpu.to(vae.dtype))
+        if hasattr(decoded, 'sample'):
+            decoded = decoded.sample
+        elif isinstance(decoded, dict):
+            decoded = decoded['sample']
+        
+        # Decoded is already on CPU, ensure float32
+        decoded = decoded.float()
+        
+        # Clean up CPU latents after decode
+        del final_latents_cpu
         
         # Handle frame dimension in decoded tensor before indexing
         # VAE decode returns 5D tensor [B, C, num_frames, H, W], squeeze frame dimension for single images
@@ -987,7 +980,8 @@ class QwenImagePipeline(BasePipeline):
             images.append(pil_img)
         
         # Explicitly delete large tensors to free GPU memory before returning
-        del decoded, final_latents, latents, x_0, x_1, prompt_embeds_tensor, prompt_embeds_mask
+        # Note: final_latents was already deleted earlier (moved to CPU as final_latents_cpu, then deleted)
+        del decoded, latents, x_0, x_1, prompt_embeds_tensor, prompt_embeds_mask
         if 'attn_mask_list' in locals():
             del attn_mask_list
         if 'timesteps' in locals():
