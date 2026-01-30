@@ -397,11 +397,19 @@ class QwenImagePipeline(BasePipeline):
                                         print(f'[HOOK DEBUG] WARNING: input_layernorm.weight is on {weight.data.device} after wait_for_block!')
                                     # Force move one more time
                                     weight.data = weight.data.to('cuda', non_blocking=False)
+                                    
+                                    # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                                    import torch.nn as nn
+                                    new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
+                                    module.input_layernorm.register_parameter('weight', new_weight)
+                                    
                                     if hasattr(module.input_layernorm, '_parameters') and 'weight' in module.input_layernorm._parameters:
-                                        module.input_layernorm._parameters['weight'] = weight
-                                    setattr(module.input_layernorm, 'weight', weight)
+                                        module.input_layernorm._parameters['weight'] = new_weight
+                                    if 'weight' in module.input_layernorm.__dict__:
+                                        module.input_layernorm.__dict__['weight'] = new_weight
+                                    setattr(module.input_layernorm, 'weight', new_weight)
                                     if offloader_ref.debug:
-                                        print(f'[HOOK DEBUG] Forced input_layernorm.weight to CUDA in hook')
+                                        print(f'[HOOK DEBUG] Recreated input_layernorm.weight Parameter and forced to CUDA in hook')
                             
                             # Final CUDA synchronization to ensure all moves are complete
                             import torch

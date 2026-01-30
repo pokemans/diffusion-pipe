@@ -624,13 +624,24 @@ class ModelOffloader(Offloader):
                         # Directly modify param.data to ensure device change is tracked
                         param.data = param.data.to(self.device, non_blocking=False)
                         
+                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                        # This ensures that when forward() accesses self.weight, it sees the CUDA Parameter
+                        # The Parameter object's device property needs to be refreshed
+                        new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
+                        module.register_parameter(param_name, new_param)
+                        
                         # CRITICAL: Update module's internal state to ensure attribute access works
                         # This ensures that module.param_name (e.g., input_layernorm.weight) reflects the new device
                         if hasattr(module, '_parameters') and param_name in module._parameters:
                             # Update the _parameters dict to ensure module state is synchronized
-                            module._parameters[param_name] = param
-                        # Also update via setattr to ensure attribute access works correctly
-                        setattr(module, param_name, param)
+                            module._parameters[param_name] = new_param
+                        # Also update via setattr and __dict__ to ensure attribute access works correctly
+                        if param_name in module.__dict__:
+                            module.__dict__[param_name] = new_param
+                        setattr(module, param_name, new_param)
+                        
+                        # Update param reference for verification below
+                        param = new_param
                         
                         params_moved += 1
                         
@@ -650,6 +661,34 @@ class ModelOffloader(Offloader):
                     if self.debug:
                         print(f"[{self.block_type}] Second pass: Moving parameter {param_name} from {actual_device} to {self.device.type}")
                     param.data = param.data.to(self.device, non_blocking=False)
+                    
+                    # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                    # Find the module that owns this parameter
+                    parts = param_name.split('.')
+                    if len(parts) == 1:
+                        # Direct parameter on block
+                        new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
+                        block.register_parameter(param_name, new_param)
+                        if hasattr(block, '_parameters') and param_name in block._parameters:
+                            block._parameters[param_name] = new_param
+                        if param_name in block.__dict__:
+                            block.__dict__[param_name] = new_param
+                        setattr(block, param_name, new_param)
+                    else:
+                        # Nested parameter, find the submodule
+                        module_path = '.'.join(parts[:-1])
+                        param_attr = parts[-1]
+                        for name, module in block.named_modules():
+                            if name == module_path or name.endswith(module_path):
+                                new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
+                                module.register_parameter(param_attr, new_param)
+                                if hasattr(module, '_parameters') and param_attr in module._parameters:
+                                    module._parameters[param_attr] = new_param
+                                if param_attr in module.__dict__:
+                                    module.__dict__[param_attr] = new_param
+                                setattr(module, param_attr, new_param)
+                                break
+                    
                     params_moved += 1
         
         if self.debug and params_moved > 0:
@@ -672,8 +711,26 @@ class ModelOffloader(Offloader):
                         if isinstance(current_module, torch.nn.Parameter):
                             # Found the parameter, move it directly
                             current_module.data = current_module.data.to(self.device, non_blocking=False)
+                            
+                            # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                            # We need to find the parent module to register the new parameter
+                            parent_module = block
+                            for p in parts[:-1]:
+                                if hasattr(parent_module, p):
+                                    parent_module = getattr(parent_module, p)
+                            
+                            new_param = nn.Parameter(current_module.data, requires_grad=current_module.requires_grad)
+                            param_attr = parts[-1]
+                            if hasattr(parent_module, 'register_parameter'):
+                                parent_module.register_parameter(param_attr, new_param)
+                            if hasattr(parent_module, '_parameters') and param_attr in parent_module._parameters:
+                                parent_module._parameters[param_attr] = new_param
+                            if param_attr in parent_module.__dict__:
+                                parent_module.__dict__[param_attr] = new_param
+                            setattr(parent_module, param_attr, new_param)
+                            
                             if self.debug:
-                                print(f"[{self.block_type}] Retried moving {param_name} through direct access")
+                                print(f"[{self.block_type}] Retried moving {param_name} through direct access and recreated Parameter")
                             found = True
                             break
                     else:
@@ -686,12 +743,19 @@ class ModelOffloader(Offloader):
                             for mod_param_name, mod_param in module.named_parameters(recurse=False):
                                 if mod_param_name in param_name or param_name.endswith(mod_param_name):
                                     mod_param.data = mod_param.data.to(self.device, non_blocking=False)
+                                    
+                                    # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                                    new_mod_param = nn.Parameter(mod_param.data, requires_grad=mod_param.requires_grad)
+                                    module.register_parameter(mod_param_name, new_mod_param)
+                                    
                                     # Update module state after moving
                                     if hasattr(module, '_parameters') and mod_param_name in module._parameters:
-                                        module._parameters[mod_param_name] = mod_param
-                                    setattr(module, mod_param_name, mod_param)
+                                        module._parameters[mod_param_name] = new_mod_param
+                                    if mod_param_name in module.__dict__:
+                                        module.__dict__[mod_param_name] = new_mod_param
+                                    setattr(module, mod_param_name, new_mod_param)
                                     if self.debug:
-                                        print(f"[{self.block_type}] Retried moving {param_name} through module {module_name}")
+                                        print(f"[{self.block_type}] Retried moving {param_name} through module {module_name} and recreated Parameter")
                                     found = True
                                     break
                             if found:
@@ -747,6 +811,10 @@ class ModelOffloader(Offloader):
                     print(f"[{self.block_type}] ERROR: Parameter {param_name} still on {actual_param_device} (checked via param.data.device) after wait_for_block!")
                 # Try one more time to move it and update module state
                 param.data = param.data.to(self.device, non_blocking=False)
+                
+                # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
+                
                 # Update module state
                 parts = param_name.split('.')
                 if len(parts) > 1:
@@ -755,10 +823,21 @@ class ModelOffloader(Offloader):
                     param_attr = parts[-1]
                     for name, module in block.named_modules():
                         if name == module_path or name.endswith(module_path):
+                            module.register_parameter(param_attr, new_param)
                             if hasattr(module, '_parameters') and param_attr in module._parameters:
-                                module._parameters[param_attr] = param
-                            setattr(module, param_attr, param)
+                                module._parameters[param_attr] = new_param
+                            if param_attr in module.__dict__:
+                                module.__dict__[param_attr] = new_param
+                            setattr(module, param_attr, new_param)
                             break
+                else:
+                    # Direct parameter on block
+                    block.register_parameter(param_name, new_param)
+                    if hasattr(block, '_parameters') and param_name in block._parameters:
+                        block._parameters[param_name] = new_param
+                    if param_name in block.__dict__:
+                        block.__dict__[param_name] = new_param
+                    setattr(block, param_name, new_param)
         
         for buffer_name, buffer in block.named_buffers():
             if buffer is not None and buffer.device.type != self.device.type:
@@ -792,28 +871,38 @@ class ModelOffloader(Offloader):
             for param_name, param in parent_layer.named_parameters():
                 # Access device property to force reference update
                 actual_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
-                if actual_device != self.device.type:
-                    if self.debug:
-                        print(f"[{self.block_type}] Parent model param {param_name} still on {actual_device}, moving to {self.device.type}")
-                    # Move parameter through parent model structure
-                    param.data = param.data.to(self.device, non_blocking=False)
-                    # Update parent module's internal state
-                    parts = param_name.split('.')
-                    if len(parts) == 1:
-                        # Direct parameter on parent layer
-                        if hasattr(parent_layer, '_parameters') and param_name in parent_layer._parameters:
-                            parent_layer._parameters[param_name] = param
-                        setattr(parent_layer, param_name, param)
-                    else:
-                        # Nested parameter, find the submodule
-                        module_path = '.'.join(parts[:-1])
-                        param_attr = parts[-1]
-                        for name, module in parent_layer.named_modules():
-                            if name == module_path or name.endswith(module_path):
-                                if hasattr(module, '_parameters') and param_attr in module._parameters:
-                                    module._parameters[param_attr] = param
-                                setattr(module, param_attr, param)
-                                break
+                    if actual_device != self.device.type:
+                        if self.debug:
+                            print(f"[{self.block_type}] Parent model param {param_name} still on {actual_device}, moving to {self.device.type}")
+                        # Move parameter through parent model structure
+                        param.data = param.data.to(self.device, non_blocking=False)
+                        
+                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                        new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
+                        
+                        # Update parent module's internal state
+                        parts = param_name.split('.')
+                        if len(parts) == 1:
+                            # Direct parameter on parent layer
+                            parent_layer.register_parameter(param_name, new_param)
+                            if hasattr(parent_layer, '_parameters') and param_name in parent_layer._parameters:
+                                parent_layer._parameters[param_name] = new_param
+                            if param_name in parent_layer.__dict__:
+                                parent_layer.__dict__[param_name] = new_param
+                            setattr(parent_layer, param_name, new_param)
+                        else:
+                            # Nested parameter, find the submodule
+                            module_path = '.'.join(parts[:-1])
+                            param_attr = parts[-1]
+                            for name, module in parent_layer.named_modules():
+                                if name == module_path or name.endswith(module_path):
+                                    module.register_parameter(param_attr, new_param)
+                                    if hasattr(module, '_parameters') and param_attr in module._parameters:
+                                        module._parameters[param_attr] = new_param
+                                    if param_attr in module.__dict__:
+                                        module.__dict__[param_attr] = new_param
+                                    setattr(module, param_attr, new_param)
+                                    break
             
             # CRITICAL: Force update of specific attributes that forward() will access directly
             # Instead of calling .to(device) which might interfere, we directly update the exact
@@ -832,16 +921,22 @@ class ModelOffloader(Offloader):
                             print(f"[{self.block_type}] Direct attribute update: Moving input_layernorm.weight from {weight_device} to {self.device.type}")
                         # Move through exact reference forward() uses
                         weight.data = weight.data.to(self.device, non_blocking=False)
+                        
+                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                        # This ensures that when forward() accesses self.weight, it sees the CUDA Parameter
+                        new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
+                        input_layernorm.register_parameter('weight', new_weight)
+                        
                         # Force update of module's internal state through multiple paths
                         if hasattr(input_layernorm, '_parameters') and 'weight' in input_layernorm._parameters:
-                            input_layernorm._parameters['weight'] = weight
+                            input_layernorm._parameters['weight'] = new_weight
                         # Update __dict__ to ensure no cached references exist
                         if 'weight' in input_layernorm.__dict__:
-                            input_layernorm.__dict__['weight'] = weight
+                            input_layernorm.__dict__['weight'] = new_weight
                         # Also use setattr to ensure attribute access works
-                        setattr(input_layernorm, 'weight', weight)
+                        setattr(input_layernorm, 'weight', new_weight)
                         if self.debug:
-                            print(f"[{self.block_type}] Updated input_layernorm.weight through all reference paths")
+                            print(f"[{self.block_type}] Recreated input_layernorm.weight Parameter object and updated all reference paths")
             
             # Also update post_attention_layernorm.weight if it exists
             if hasattr(parent_layer, 'post_attention_layernorm'):
@@ -853,11 +948,16 @@ class ModelOffloader(Offloader):
                         if self.debug:
                             print(f"[{self.block_type}] Direct attribute update: Moving post_attention_layernorm.weight from {weight_device} to {self.device.type}")
                         weight.data = weight.data.to(self.device, non_blocking=False)
+                        
+                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                        new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
+                        post_layernorm.register_parameter('weight', new_weight)
+                        
                         if hasattr(post_layernorm, '_parameters') and 'weight' in post_layernorm._parameters:
-                            post_layernorm._parameters['weight'] = weight
+                            post_layernorm._parameters['weight'] = new_weight
                         if 'weight' in post_layernorm.__dict__:
-                            post_layernorm.__dict__['weight'] = weight
-                        setattr(post_layernorm, 'weight', weight)
+                            post_layernorm.__dict__['weight'] = new_weight
+                        setattr(post_layernorm, 'weight', new_weight)
         
         # Direct access test: Check if input_layernorm.weight is accessible and on correct device
         # This is a critical test because input_layernorm is a nested submodule that was causing issues
@@ -944,14 +1044,19 @@ class ModelOffloader(Offloader):
                         if self.debug:
                             print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight is on {weight_device}, forcing move to {self.device.type}")
                         weight.data = weight.data.to(self.device, non_blocking=False)
+                        
+                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                        new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
+                        input_layernorm.register_parameter('weight', new_weight)
+                        
                         # Update all reference paths
                         if hasattr(input_layernorm, '_parameters') and 'weight' in input_layernorm._parameters:
-                            input_layernorm._parameters['weight'] = weight
+                            input_layernorm._parameters['weight'] = new_weight
                         if 'weight' in input_layernorm.__dict__:
-                            input_layernorm.__dict__['weight'] = weight
-                        setattr(input_layernorm, 'weight', weight)
+                            input_layernorm.__dict__['weight'] = new_weight
+                        setattr(input_layernorm, 'weight', new_weight)
                         if self.debug:
-                            print(f"[{self.block_type}] FINAL CHECK: Forced input_layernorm.weight to {self.device.type}")
+                            print(f"[{self.block_type}] FINAL CHECK: Recreated input_layernorm.weight Parameter and forced to {self.device.type}")
                     else:
                         if self.debug:
                             print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight confirmed on {weight_device}")
