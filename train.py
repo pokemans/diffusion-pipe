@@ -493,6 +493,32 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
+    
+    # Text encoder block swapping must be set up BEFORE creating DatasetManager
+    # so it's available during caching
+    text_encoder_blocks_to_swap = config.get('text_encoder_blocks_to_swap', 0)
+    print(f'[DEBUG] Checking text_encoder_blocks_to_swap: value={text_encoder_blocks_to_swap}, type={type(text_encoder_blocks_to_swap)}')
+    if text_encoder_blocks_to_swap > 0:
+        print(f'[DEBUG] Enabling text encoder block swapping with {text_encoder_blocks_to_swap} blocks')
+        try:
+            model.enable_text_encoder_block_swap(text_encoder_blocks_to_swap)
+            print(f'[DEBUG] enable_text_encoder_block_swap completed. text_encoder_offloaders = {getattr(model, "text_encoder_offloaders", "NOT SET")}')
+        except Exception as e:
+            print(f'[ERROR] Failed to enable text encoder block swapping: {e}')
+            import traceback
+            traceback.print_exc()
+            raise
+        try:
+            model.prepare_text_encoder_block_swap_for_caching()
+            print(f'[DEBUG] prepare_text_encoder_block_swap_for_caching completed')
+        except Exception as e:
+            print(f'[ERROR] Failed to prepare text encoder block swap for caching: {e}')
+            import traceback
+            traceback.print_exc()
+            raise
+    else:
+        print(f'[DEBUG] text_encoder_blocks_to_swap is 0 or falsy, skipping block swapping setup')
+    
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
@@ -626,7 +652,7 @@ if __name__ == '__main__':
             dir=logging_dir
         )
 
-    # Block swapping
+    # Block swapping (for transformer blocks, not text encoder)
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
@@ -635,28 +661,6 @@ if __name__ == '__main__':
             pass
         deepspeed.pipe.PipelineModule.to = to
         model.enable_block_swap(blocks_to_swap)
-
-    # Text encoder block swapping
-    text_encoder_blocks_to_swap = config.get('text_encoder_blocks_to_swap', 0)
-    print(f'[DEBUG] Checking text_encoder_blocks_to_swap: value={text_encoder_blocks_to_swap}, type={type(text_encoder_blocks_to_swap)}')
-    if text_encoder_blocks_to_swap > 0:
-        print(f'[DEBUG] Enabling text encoder block swapping with {text_encoder_blocks_to_swap} blocks')
-        try:
-            model.enable_text_encoder_block_swap(text_encoder_blocks_to_swap)
-            print(f'[DEBUG] enable_text_encoder_block_swap completed. text_encoder_offloaders = {getattr(model, "text_encoder_offloaders", "NOT SET")}')
-        except Exception as e:
-            print(f'[ERROR] Failed to enable text encoder block swapping: {e}')
-            import traceback
-            traceback.print_exc()
-            raise
-        try:
-            model.prepare_text_encoder_block_swap_for_caching()
-            print(f'[DEBUG] prepare_text_encoder_block_swap_for_caching completed')
-        except Exception as e:
-            print(f'[ERROR] Failed to prepare text encoder block swap for caching: {e}')
-            import traceback
-            traceback.print_exc()
-            raise
 
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}
