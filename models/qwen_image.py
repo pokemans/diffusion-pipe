@@ -375,6 +375,8 @@ class QwenImagePipeline(BasePipeline):
                         # Only do block swapping if it's enabled (during caching)
                         # During training, block swapping should be disabled
                         if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
+                            if offloader_ref.debug:
+                                print(f'[HOOK DEBUG] Forward pre-hook called for layer {layer_idx}')
                             offloader_ref.wait_for_block(layer_idx)
                         return None
                     
@@ -382,6 +384,8 @@ class QwenImagePipeline(BasePipeline):
                         # Only do block swapping if it's enabled (during caching)
                         # During training, block swapping should be disabled
                         if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
+                            if offloader_ref.debug:
+                                print(f'[HOOK DEBUG] Forward post-hook called for layer {layer_idx}')
                             offloader_ref.submit_move_blocks_forward(layer_idx)
                         return output
                     
@@ -393,7 +397,12 @@ class QwenImagePipeline(BasePipeline):
                 # Register post-hook to submit block move after forward
                 handle_post = layer.register_forward_hook(post_hook)
                 self._text_encoder_hooks.append((handle_pre, handle_post))
-            print(f'[DEBUG] Registered {len(self._text_encoder_hooks)} forward hooks')
+                
+                # Verify hook registration
+                if offloader.debug:
+                    print(f'[HOOK DEBUG] Registered hooks for layer {i}: {type(layer).__name__}')
+            
+            print(f'[DEBUG] Registered {len(self._text_encoder_hooks)} forward hooks on {len(layers)} layers')
         except Exception as e:
             print(f'[ERROR] Failed to register forward hooks: {e}')
             import traceback
