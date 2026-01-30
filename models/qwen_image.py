@@ -911,9 +911,8 @@ class QwenImagePipeline(BasePipeline):
         # Apply VAE normalization reversal
         final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
         
-        # VAE expects (bs, c, f, h, w) format, but for single image we need (bs, c, h, w)
-        # Remove frame dimension: (bs, c, f, h, w) -> (bs, c, h, w)
-        final_latents = final_latents.squeeze(2)  # Remove frame dimension
+        # VAE expects (bs, c, f, h, w) format - keep frame dimension even for single images (num_frames=1)
+        # The VAE can handle num_frames=1 for single image generation
         
         # Decode
         decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
