@@ -597,26 +597,47 @@ class ModelOffloader(Offloader):
         # CRITICAL: Always check and move ALL parameters, regardless of detected device
         # This handles cases where blocks are partially on CUDA (some params on CUDA, some on CPU)
         # We must ensure ALL parameters are on CUDA before forward pass
+        # IMPORTANT: We iterate through ALL named_modules() to catch nested submodules like input_layernorm
         params_moved = 0
         params_on_wrong_device = []
         
-        # Iterate through all modules and their parameters to ensure we catch everything
+        # First pass: Move all parameters from ALL modules (including nested submodules)
+        # This ensures submodules like input_layernorm within decoder_layer are handled
         for module_name, module in block.named_modules():
+            # Move the module structure itself first
+            module.to(self.device)
+            
+            # Then explicitly move all parameters of this module
             for param_name, param in module.named_parameters(recurse=False):
                 full_param_name = f"{module_name}.{param_name}" if module_name else param_name
-                if param.device.type != self.device.type:
+                # Check device by accessing .data.device to get actual device
+                actual_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
+                if actual_device != self.device.type:
                     if 'lora' not in full_param_name:  # Skip LoRA params when moving to CPU
                         if self.debug:
-                            print(f"[{self.block_type}] Moving parameter {full_param_name} from {param.device} to {self.device}")
+                            print(f"[{self.block_type}] Moving parameter {full_param_name} from {actual_device} to {self.device.type}")
                         # Use blocking move to ensure parameter is on device before forward pass
-                        # Access parameter through its module to ensure proper device tracking
+                        # Directly modify param.data to ensure device change is tracked
                         param.data = param.data.to(self.device, non_blocking=False)
                         params_moved += 1
-                        # Verify the parameter is now on device
-                        if param.device.type != self.device.type:
-                            params_on_wrong_device.append((full_param_name, param.device))
+                        
+                        # Verify immediately after move
+                        verify_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
+                        if verify_device != self.device.type:
+                            params_on_wrong_device.append((full_param_name, verify_device))
                             if self.debug:
-                                print(f"[{self.block_type}] WARNING: Parameter {full_param_name} still on {param.device} after move")
+                                print(f"[{self.block_type}] WARNING: Parameter {full_param_name} still on {verify_device} after move")
+        
+        # Second pass: Also iterate through all named_parameters() at block level as fallback
+        # This catches any parameters that might have been missed
+        for param_name, param in block.named_parameters():
+            actual_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
+            if actual_device != self.device.type:
+                if 'lora' not in param_name:  # Skip LoRA params
+                    if self.debug:
+                        print(f"[{self.block_type}] Second pass: Moving parameter {param_name} from {actual_device} to {self.device.type}")
+                    param.data = param.data.to(self.device, non_blocking=False)
+                    params_moved += 1
         
         if self.debug and params_moved > 0:
             print(f"[{self.block_type}] Moved {params_moved} parameters for block {block_idx}")
@@ -716,6 +737,13 @@ class ModelOffloader(Offloader):
             print(f"[{self.block_type}] WARNING: Verification failed for block {block_idx}. Some parameters/buffers may still be on wrong device.")
         elif self.debug:
             print(f"[{self.block_type}] Verification passed: All parameters and buffers on {self.device} for block {block_idx}")
+        
+        # Final explicit CUDA synchronization before forward pass
+        # This ensures all parameter moves are complete and visible before the forward pass executes
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+            if self.debug:
+                print(f"[{self.block_type}] Final CUDA synchronization completed for block {block_idx}")
 
     def submit_move_blocks_forward(self, block_idx: int):
         # check if blocks_to_swap is enabled

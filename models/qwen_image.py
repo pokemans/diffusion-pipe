@@ -350,7 +350,7 @@ class QwenImagePipeline(BasePipeline):
                 False,  # supports_backward=False for text encoders (inference only)
                 torch.device('cuda'),
                 False,  # reentrant_activation_checkpointing not used for text encoders
-                debug=False
+                debug=True  # Enable debug mode to diagnose block swapping issues
             )
             self.text_encoder_offloaders.append(offloader)
             print(f'[DEBUG] Created ModelOffloader successfully')
@@ -374,10 +374,14 @@ class QwenImagePipeline(BasePipeline):
                     def forward_pre_hook(module, input):
                         # Only do block swapping if it's enabled (during caching)
                         # During training, block swapping should be disabled
+                        if offloader_ref.debug:
+                            print(f'[HOOK DEBUG] Forward pre-hook EXECUTING for layer {layer_idx}, module={type(module).__name__}, blocks_to_swap={offloader_ref.blocks_to_swap}')
                         if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
                             if offloader_ref.debug:
-                                print(f'[HOOK DEBUG] Forward pre-hook called for layer {layer_idx}')
+                                print(f'[HOOK DEBUG] Calling wait_for_block({layer_idx}) for layer {layer_idx}')
                             offloader_ref.wait_for_block(layer_idx)
+                            if offloader_ref.debug:
+                                print(f'[HOOK DEBUG] wait_for_block({layer_idx}) completed for layer {layer_idx}')
                         return None
                     
                     def forward_hook(module, input, output):
