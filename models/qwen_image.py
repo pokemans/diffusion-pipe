@@ -812,7 +812,7 @@ class QwenImagePipeline(BasePipeline):
         )
 
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
-"""
+        """
         Generate sample images from text prompts using flow matching sampling.
         Processes prompts sequentially to minimize VRAM usage.
         
@@ -897,7 +897,7 @@ class QwenImagePipeline(BasePipeline):
                 images.append(pil_image)
 
         return images        
-        
+
     def to_layers(self):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
