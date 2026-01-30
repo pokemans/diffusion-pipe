@@ -350,7 +350,8 @@ class QwenImagePipeline(BasePipeline):
                 False,  # supports_backward=False for text encoders (inference only)
                 torch.device('cuda'),
                 False,  # reentrant_activation_checkpointing not used for text encoders
-                debug=True  # Enable debug mode to diagnose block swapping issues
+                debug=True,  # Enable debug mode to diagnose block swapping issues
+                parent_layers=layers  # Pass parent model's layers ModuleList for parameter sync
             )
             self.text_encoder_offloaders.append(offloader)
             print(f'[DEBUG] Created ModelOffloader successfully')

@@ -319,12 +319,14 @@ class ModelOffloader(Offloader):
         device: torch.device,
         reentrant_activation_checkpointing: bool,
         debug: bool = False,
+        parent_layers: list[nn.Module] = None,
     ):
         super().__init__(block_type, blocks, num_blocks, blocks_to_swap, device, debug)
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
         self.reentrant_activation_checkpointing = reentrant_activation_checkpointing
+        self.parent_layers = parent_layers  # Store parent model's layers ModuleList for parameter sync
 
         if self.supports_backward:
             # register backward hooks
@@ -775,23 +777,91 @@ class ModelOffloader(Offloader):
         elif self.debug:
             print(f"[{self.block_type}] Verification passed: All parameters and buffers on {self.device} for block {block_idx}")
         
+        # CRITICAL: Sync parent model parameter references
+        # The block is a reference to a module in the parent model's ModuleList
+        # After moving block parameters, we need to ensure the parent model's parameter registry is updated
+        # This ensures that when forward pass accesses parameters through parent model structure,
+        # it sees the updated CUDA tensors, not stale CPU references
+        if self.parent_layers is not None and block_idx < len(self.parent_layers):
+            parent_layer = self.parent_layers[block_idx]
+            if self.debug:
+                print(f"[{self.block_type}] Syncing parent model parameter references for block {block_idx}")
+            
+            # Force parameter access through parent model structure to update references
+            # This ensures parent model's ModuleList sees the updated device
+            for param_name, param in parent_layer.named_parameters():
+                # Access device property to force reference update
+                actual_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
+                if actual_device != self.device.type:
+                    if self.debug:
+                        print(f"[{self.block_type}] Parent model param {param_name} still on {actual_device}, moving to {self.device.type}")
+                    # Move parameter through parent model structure
+                    param.data = param.data.to(self.device, non_blocking=False)
+                    # Update parent module's internal state
+                    parts = param_name.split('.')
+                    if len(parts) == 1:
+                        # Direct parameter on parent layer
+                        if hasattr(parent_layer, '_parameters') and param_name in parent_layer._parameters:
+                            parent_layer._parameters[param_name] = param
+                        setattr(parent_layer, param_name, param)
+                    else:
+                        # Nested parameter, find the submodule
+                        module_path = '.'.join(parts[:-1])
+                        param_attr = parts[-1]
+                        for name, module in parent_layer.named_modules():
+                            if name == module_path or name.endswith(module_path):
+                                if hasattr(module, '_parameters') and param_attr in module._parameters:
+                                    module._parameters[param_attr] = param
+                                setattr(module, param_attr, param)
+                                break
+            
+            # Also call .to(device) on parent layer to ensure PyTorch's internal state is synced
+            # This is safe because we've already moved all parameters manually
+            parent_layer.to(self.device)
+            if self.debug:
+                print(f"[{self.block_type}] Called parent_layer.to({self.device}) to sync parent model state")
+        
         # Direct access test: Check if input_layernorm.weight is accessible and on correct device
         # This is a critical test because input_layernorm is a nested submodule that was causing issues
+        # Test both block access and parent model access to ensure both see updated device
         if self.debug:
             try:
-                # Try to find input_layernorm in the block
+                # Test 1: Check through block reference
+                block_test_passed = False
                 for name, module in block.named_modules():
                     if 'input_layernorm' in name.lower() or 'layernorm' in name.lower():
                         if hasattr(module, 'weight'):
                             weight_device = module.weight.data.device.type if hasattr(module.weight, 'data') else module.weight.device.type
                             if weight_device != self.device.type:
-                                print(f"[{self.block_type}] WARNING: Direct access test - {name}.weight is on {weight_device}, expected {self.device.type}")
+                                print(f"[{self.block_type}] WARNING: Block access test - {name}.weight is on {weight_device}, expected {self.device.type}")
                             else:
-                                print(f"[{self.block_type}] Direct access test - {name}.weight is correctly on {weight_device}")
+                                print(f"[{self.block_type}] Block access test - {name}.weight is correctly on {weight_device}")
+                                block_test_passed = True
                         break
+                
+                # Test 2: Check through parent model structure (CRITICAL - this is what forward pass uses)
+                if self.parent_layers is not None and block_idx < len(self.parent_layers):
+                    parent_layer = self.parent_layers[block_idx]
+                    parent_test_passed = False
+                    for name, module in parent_layer.named_modules():
+                        if 'input_layernorm' in name.lower() or 'layernorm' in name.lower():
+                            if hasattr(module, 'weight'):
+                                weight_device = module.weight.data.device.type if hasattr(module.weight, 'data') else module.weight.device.type
+                                if weight_device != self.device.type:
+                                    print(f"[{self.block_type}] ERROR: Parent model access test - {name}.weight is on {weight_device}, expected {self.device.type}")
+                                    print(f"[{self.block_type}] This indicates parent model still has stale CPU references!")
+                                else:
+                                    print(f"[{self.block_type}] Parent model access test - {name}.weight is correctly on {weight_device}")
+                                    parent_test_passed = True
+                            break
+                    
+                    if not parent_test_passed:
+                        print(f"[{self.block_type}] WARNING: Parent model access test failed - forward pass may see CPU parameters")
             except Exception as e:
                 if self.debug:
                     print(f"[{self.block_type}] Direct access test failed: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         # Final explicit CUDA synchronization before forward pass
         # This ensures all parameter moves are complete and visible before the forward pass executes
