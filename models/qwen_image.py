@@ -284,6 +284,42 @@ class QwenImagePipeline(BasePipeline):
     def get_text_encoders(self):
         return [self.text_encoder]
 
+    def _move_meta_tensors_to_device(self, module, target_device):
+        """
+        Recursively move all parameters and buffers from meta device to target device.
+        This ensures that all tensors are on a real device before use, matching the behavior
+        of transformer block swapping which calls block.to(device).
+        
+        Meta tensors cannot be moved directly with .to() because they have no actual storage.
+        This function handles them by creating new tensors on the target device when needed.
+        """
+        target_device = torch.device(target_device) if isinstance(target_device, str) else target_device
+        meta_device = torch.device('meta')
+        
+        # Move all parameters
+        for name, param in module.named_parameters(recurse=False):
+            if param.device == meta_device:
+                # Meta tensors can't be moved directly, need to create new tensor
+                # Initialize to zeros (safe default - if important, should have been loaded from checkpoint)
+                new_param = torch.nn.Parameter(
+                    torch.zeros(param.shape, device=target_device, dtype=param.dtype),
+                    requires_grad=param.requires_grad
+                )
+                # Replace the parameter using register_parameter to ensure proper registration
+                module._parameters[name] = new_param
+        
+        # Move all buffers
+        for name, buffer in module.named_buffers(recurse=False):
+            if buffer.device == meta_device:
+                # Meta buffers can't be moved directly, need to create new buffer
+                # Initialize to zeros (safe default - if important, should have been loaded from checkpoint)
+                new_buffer = torch.zeros(buffer.shape, device=target_device, dtype=buffer.dtype)
+                module.register_buffer(name, new_buffer)
+        
+        # Recursively process child modules
+        for child in module.children():
+            self._move_meta_tensors_to_device(child, target_device)
+
     def cache_sample_prompts(self, prompts):
         """Cache text embeddings for sample generation prompts."""
         if prompts is None or len(prompts) == 0:
@@ -315,48 +351,29 @@ class QwenImagePipeline(BasePipeline):
                     for layer in layers:
                         layer.to(target_device)
                     # Also move the rest of the text encoder structure
-                    # Check if we need to move (like DatasetManager)
+                    # Temporarily detach layers to move structure
+                    language_model.model.layers = None
                     try:
-                        # Check if structure needs moving
-                        needs_move = False
+                        # Try to move the structure normally first
                         try:
-                            current_device_type = next(text_encoder.parameters()).device.type
-                            if current_device_type != target_device:
-                                needs_move = True
-                        except (StopIteration, RuntimeError):
-                            # Can't check device, assume we need to move
-                            needs_move = True
-                        
-                        if needs_move:
-                            # Temporarily detach layers to move structure
-                            language_model.model.layers = None
-                            try:
-                                text_encoder.to(target_device)
-                            except NotImplementedError as e:
-                                if "meta tensor" in str(e):
-                                    # Some parameters on meta device - layers are already moved, skip structure move
-                                    # This is OK since layers contain the main parameters
-                                    pass
-                                else:
-                                    raise
-                            finally:
-                                language_model.model.layers = layers
-                        else:
-                            # Already on target device, no need to move
-                            pass
-                    except Exception:
-                        # If anything fails, ensure layers are reattached
-                        if hasattr(language_model.model, 'layers') and language_model.model.layers is None:
-                            language_model.model.layers = layers
-                        raise
+                            text_encoder.to(target_device)
+                        except NotImplementedError as e:
+                            if "meta tensor" in str(e):
+                                # Some parameters/buffers on meta device - manually move them
+                                # This matches the behavior of transformer block swapping
+                                self._move_meta_tensors_to_device(text_encoder, target_device)
+                            else:
+                                raise
+                    finally:
+                        language_model.model.layers = layers
                 else:
                     # Fallback: move entire model
                     try:
                         text_encoder.to(target_device)
                     except NotImplementedError as e:
                         if "meta tensor" in str(e):
-                            # Some parameters on meta device - this is OK if layers were already moved
-                            pass
+                            # Some parameters/buffers on meta device - manually move them
+                            self._move_meta_tensors_to_device(text_encoder, target_device)
                         else:
                             raise
             else:
@@ -365,8 +382,8 @@ class QwenImagePipeline(BasePipeline):
                     text_encoder.to(target_device)
                 except NotImplementedError as e:
                     if "meta tensor" in str(e):
-                        # Some parameters on meta device - this is OK
-                        pass
+                        # Some parameters/buffers on meta device - manually move them
+                        self._move_meta_tensors_to_device(text_encoder, target_device)
                     else:
                         raise
         
