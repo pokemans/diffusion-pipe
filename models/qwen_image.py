@@ -845,6 +845,8 @@ class QwenImagePipeline(BasePipeline):
         
         # Process each prompt sequentially
         for prompt_idx, prompt in enumerate(prompts):
+            # Initialize prompt_embeds to avoid UnboundLocalError (Python sees del later in function)
+            prompt_embeds = None
             print(f'Processing prompt {prompt_idx + 1}/{len(prompts)}: {prompt}')
             
             # Set random seed for this prompt (seed + prompt_idx for different results)
@@ -925,6 +927,7 @@ class QwenImagePipeline(BasePipeline):
             prompt_embeds_mask_single = torch.ones(max_text_len, dtype=torch.bool, device=device)
             
             # Reshape prompt_embeds for model input: add batch dimension
+            # Initialize prompt_embeds before loop to avoid UnboundLocalError (Python sees del later)
             prompt_embeds = prompt_embeds_single.unsqueeze(0)  # (1, seq_len, hidden_dim)
             prompt_embeds_mask = prompt_embeds_mask_single.unsqueeze(0)  # (1, seq_len)
 
@@ -964,28 +967,18 @@ class QwenImagePipeline(BasePipeline):
                     
                     # Forward through layers
                     model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
-                    del attention_mask, prompt_embeds, t_for_model, img_shapes, txt_seq_lens
                     layers = self.to_layers()
                     predicted_target_packed = model_inputs
                     for layer in layers:
                         predicted_target_packed = layer(predicted_target_packed)
-                    
-                    del layers, model_inputs
-                    
+                                        
                     # Unpack predicted target: (1, seq_len, hidden_dim) -> (1, c, f, h, w)
                     predicted_target = self._unpack_latents(predicted_target_packed, 1, num_channels_latents, latent_h, latent_w)
-                    del predicted_target_packed
                     # Flow matching ODE: dx/dt = v_t(x) where v_t(x_t) = x_0 - x_1
                     # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
                     # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
                     x_t = x_t - dt * predicted_target
                     
-                    # Explicitly delete intermediate tensors to free VRAM
-                    del x_t_packed, predicted_target
-                    
-                    # Clear CUDA cache periodically to reduce fragmentation (every 5 iterations)
-                    if (i + 1) % 5 == 0:
-                        torch.cuda.empty_cache()
             
             # After sampling, x_t should be close to x_1 (clean latents)
             latents = x_t
