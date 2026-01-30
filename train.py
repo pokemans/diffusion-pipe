@@ -639,8 +639,23 @@ if __name__ == '__main__':
     # Text encoder block swapping
     text_encoder_blocks_to_swap = config.get('text_encoder_blocks_to_swap', 0)
     if text_encoder_blocks_to_swap > 0:
-        model.enable_text_encoder_block_swap(text_encoder_blocks_to_swap)
-        model.prepare_text_encoder_block_swap_for_caching()
+        print(f'[DEBUG] Enabling text encoder block swapping with {text_encoder_blocks_to_swap} blocks')
+        try:
+            model.enable_text_encoder_block_swap(text_encoder_blocks_to_swap)
+            print(f'[DEBUG] enable_text_encoder_block_swap completed. text_encoder_offloaders = {getattr(model, "text_encoder_offloaders", "NOT SET")}')
+        except Exception as e:
+            print(f'[ERROR] Failed to enable text encoder block swapping: {e}')
+            import traceback
+            traceback.print_exc()
+            raise
+        try:
+            model.prepare_text_encoder_block_swap_for_caching()
+            print(f'[DEBUG] prepare_text_encoder_block_swap_for_caching completed')
+        except Exception as e:
+            print(f'[ERROR] Failed to prepare text encoder block swap for caching: {e}')
+            import traceback
+            traceback.print_exc()
+            raise
 
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}

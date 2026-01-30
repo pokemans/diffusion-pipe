@@ -178,28 +178,44 @@ class BasePipeline:
         Enable block swapping for text encoders. Override in model-specific classes.
         Default implementation tries to find layers in common transformer structures.
         """
-        text_encoders = self.get_text_encoders()
-        self.text_encoder_offloaders = []
+        # Always initialize text_encoder_offloaders, even if empty
+        if not hasattr(self, 'text_encoder_offloaders'):
+            self.text_encoder_offloaders = []
         
-        for text_encoder in text_encoders:
+        text_encoders = self.get_text_encoders()
+        print(f'[DEBUG] BasePipeline.enable_text_encoder_block_swap: Found {len(text_encoders)} text encoders')
+        
+        for idx, text_encoder in enumerate(text_encoders):
+            print(f'[DEBUG] Processing text encoder {idx}: type={type(text_encoder)}')
             if not isinstance(text_encoder, nn.Module):
                 # Skip ComfyUI wrapped models
+                print(f'[DEBUG] Text encoder {idx} is not nn.Module, skipping')
                 self.text_encoder_offloaders.append(None)
                 continue
             
             # Try to find layers in common transformer structures
             layers = None
-            if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'layers'):
-                layers = text_encoder.model.layers
-            elif hasattr(text_encoder, 'layers'):
-                layers = text_encoder.layers
-            elif hasattr(text_encoder, 'encoder') and hasattr(text_encoder.encoder, 'layer'):
-                layers = text_encoder.encoder.layer
-            elif hasattr(text_encoder, 'encoder') and hasattr(text_encoder.encoder, 'layers'):
-                layers = text_encoder.encoder.layers
+            try:
+                if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'layers'):
+                    layers = text_encoder.model.layers
+                    print(f'[DEBUG] Found layers via model.layers: {len(layers) if layers else 0} layers')
+                elif hasattr(text_encoder, 'layers'):
+                    layers = text_encoder.layers
+                    print(f'[DEBUG] Found layers via layers: {len(layers) if layers else 0} layers')
+                elif hasattr(text_encoder, 'encoder') and hasattr(text_encoder.encoder, 'layer'):
+                    layers = text_encoder.encoder.layer
+                    print(f'[DEBUG] Found layers via encoder.layer: {len(layers) if layers else 0} layers')
+                elif hasattr(text_encoder, 'encoder') and hasattr(text_encoder.encoder, 'layers'):
+                    layers = text_encoder.encoder.layers
+                    print(f'[DEBUG] Found layers via encoder.layers: {len(layers) if layers else 0} layers')
+            except Exception as e:
+                print(f'[ERROR] Exception while finding layers for text encoder {idx}: {e}')
+                import traceback
+                traceback.print_exc()
             
             if layers is None or len(layers) == 0:
                 # Model doesn't support block swapping or layers not found
+                print(f'[DEBUG] Text encoder {idx}: No layers found, appending None')
                 self.text_encoder_offloaders.append(None)
                 continue
             
@@ -208,21 +224,30 @@ class BasePipeline:
                 blocks_to_swap <= num_blocks - 2
             ), f'Cannot swap more than {num_blocks - 2} text encoder blocks. Requested {blocks_to_swap} blocks to swap.'
             
-            from utils.offloading import ModelOffloader
-            offloader = ModelOffloader(
-                'TextEncoderBlock',
-                list(layers),
-                num_blocks,
-                blocks_to_swap,
-                False,  # supports_backward=False for text encoders (inference only)
-                torch.device('cuda'),
-                False,  # reentrant_activation_checkpointing not used for text encoders
-                debug=False
-            )
-            self.text_encoder_offloaders.append(offloader)
+            try:
+                from utils.offloading import ModelOffloader
+                offloader = ModelOffloader(
+                    'TextEncoderBlock',
+                    list(layers),
+                    num_blocks,
+                    blocks_to_swap,
+                    False,  # supports_backward=False for text encoders (inference only)
+                    torch.device('cuda'),
+                    False,  # reentrant_activation_checkpointing not used for text encoders
+                    debug=False
+                )
+                self.text_encoder_offloaders.append(offloader)
+                print(f'[DEBUG] Created ModelOffloader for text encoder {idx}')
+            except Exception as e:
+                print(f'[ERROR] Failed to create ModelOffloader for text encoder {idx}: {e}')
+                import traceback
+                traceback.print_exc()
+                self.text_encoder_offloaders.append(None)
         
         if any(offloader is not None for offloader in self.text_encoder_offloaders):
             print(f'Text encoder block swap enabled. Swapping {blocks_to_swap} blocks per text encoder.')
+        else:
+            print(f'[WARNING] No text encoder offloaders were created successfully')
 
     def prepare_text_encoder_block_swap_for_caching(self):
         """

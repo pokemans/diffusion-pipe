@@ -1107,6 +1107,10 @@ class DatasetManager:
         self.datasets = []
         # Check if text encoder block swapping is enabled
         self.text_encoder_offloaders = getattr(model, 'text_encoder_offloaders', None)
+        if self.text_encoder_offloaders is not None:
+            print(f'[DEBUG] DatasetManager: text_encoder_offloaders = {self.text_encoder_offloaders}')
+        else:
+            print(f'[DEBUG] DatasetManager: text_encoder_offloaders is None')
 
     def register(self, dataset):
         self.datasets.append(dataset)
@@ -1200,17 +1204,25 @@ class DatasetManager:
                 gc.collect()
                 empty_cuda_cache()
                 # If this is a text encoder and block swapping is enabled, handle it specially
-                if id > 0 and self.text_encoder_offloaders is not None:
-                    text_encoder_idx = id - 1
-                    if (text_encoder_idx < len(self.text_encoder_offloaders) and 
-                        self.text_encoder_offloaders[text_encoder_idx] is not None):
-                        offloader = self.text_encoder_offloaders[text_encoder_idx]
-                        # For block swapping, prepare_block_devices_before_forward() moves blocks individually
-                        # to CUDA, then moves weights of swapped blocks back to CPU. This avoids OOM from
-                        # moving the entire model at once. The blocks are moved individually, so the parent
-                        # model structure doesn't need to be fully on CUDA first.
-                        offloader.prepare_block_devices_before_forward()
+                if id > 0:
+                    print(f'[DEBUG] _handle_task: Processing text encoder (id={id}), text_encoder_offloaders={self.text_encoder_offloaders}')
+                    if self.text_encoder_offloaders is not None:
+                        text_encoder_idx = id - 1
+                        print(f'[DEBUG] _handle_task: text_encoder_idx={text_encoder_idx}, len(offloaders)={len(self.text_encoder_offloaders)}')
+                        if (text_encoder_idx < len(self.text_encoder_offloaders) and 
+                            self.text_encoder_offloaders[text_encoder_idx] is not None):
+                            offloader = self.text_encoder_offloaders[text_encoder_idx]
+                            print(f'[DEBUG] _handle_task: Using block swapping for text encoder {text_encoder_idx}')
+                            # For block swapping, prepare_block_devices_before_forward() moves blocks individually
+                            # to CUDA, then moves weights of swapped blocks back to CPU. This avoids OOM from
+                            # moving the entire model at once. The blocks are moved individually, so the parent
+                            # model structure doesn't need to be fully on CUDA first.
+                            offloader.prepare_block_devices_before_forward()
+                        else:
+                            print(f'[DEBUG] _handle_task: Block swapping not available for text encoder {text_encoder_idx}, moving entire model to CUDA')
+                            self.submodels[id].to('cuda')
                     else:
+                        print(f'[DEBUG] _handle_task: text_encoder_offloaders is None, moving entire model to CUDA')
                         self.submodels[id].to('cuda')
                 else:
                     self.submodels[id].to('cuda')

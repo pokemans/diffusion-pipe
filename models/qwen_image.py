@@ -286,38 +286,61 @@ class QwenImagePipeline(BasePipeline):
         Enable block swapping for Qwen Image text encoder.
         Qwen text encoder structure: text_encoder.model.language_model.model.layers
         """
+        # Always initialize text_encoder_offloaders, even if empty
+        if not hasattr(self, 'text_encoder_offloaders'):
+            self.text_encoder_offloaders = []
+        
         text_encoder = self.text_encoder
+        print(f'[DEBUG] enable_text_encoder_block_swap: text_encoder type = {type(text_encoder)}')
+        
         # Qwen structure: model.language_model.model.layers
-        if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
-            language_model = text_encoder.model.language_model
-            if hasattr(language_model, 'model') and hasattr(language_model.model, 'layers'):
-                layers = language_model.model.layers
+        layers = None
+        try:
+            if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
+                language_model = text_encoder.model.language_model
+                if hasattr(language_model, 'model') and hasattr(language_model.model, 'layers'):
+                    layers = language_model.model.layers
+                    print(f'[DEBUG] Found layers via model.language_model.model.layers: {len(layers) if layers else 0} layers')
+                else:
+                    print(f'[DEBUG] language_model.model.layers not found')
             else:
-                # Fallback: try direct access
-                layers = None
-        else:
-            layers = None
+                print(f'[DEBUG] text_encoder.model.language_model not found')
+        except Exception as e:
+            print(f'[ERROR] Exception while finding layers: {e}')
+            import traceback
+            traceback.print_exc()
         
         if layers is None or len(layers) == 0:
-            raise RuntimeError('Could not find layers in Qwen text encoder for block swapping')
+            error_msg = 'Could not find layers in Qwen text encoder for block swapping'
+            print(f'[ERROR] {error_msg}')
+            # Still set text_encoder_offloaders to empty list to indicate we tried
+            self.text_encoder_offloaders.append(None)
+            raise RuntimeError(error_msg)
         
         num_blocks = len(layers)
         assert (
             blocks_to_swap <= num_blocks - 2
         ), f'Cannot swap more than {num_blocks - 2} text encoder blocks. Requested {blocks_to_swap} blocks to swap.'
         
-        self.text_encoder_offloaders = []
-        offloader = ModelOffloader(
-            'QwenTextEncoderBlock',
-            list(layers),
-            num_blocks,
-            blocks_to_swap,
-            False,  # supports_backward=False for text encoders (inference only)
-            torch.device('cuda'),
-            False,  # reentrant_activation_checkpointing not used for text encoders
-            debug=False
-        )
-        self.text_encoder_offloaders.append(offloader)
+        try:
+            offloader = ModelOffloader(
+                'QwenTextEncoderBlock',
+                list(layers),
+                num_blocks,
+                blocks_to_swap,
+                False,  # supports_backward=False for text encoders (inference only)
+                torch.device('cuda'),
+                False,  # reentrant_activation_checkpointing not used for text encoders
+                debug=False
+            )
+            self.text_encoder_offloaders.append(offloader)
+            print(f'[DEBUG] Created ModelOffloader successfully')
+        except Exception as e:
+            print(f'[ERROR] Failed to create ModelOffloader: {e}')
+            import traceback
+            traceback.print_exc()
+            self.text_encoder_offloaders.append(None)
+            raise
         
         # Store reference to layers and offloader for hook registration
         self._text_encoder_layers = layers
@@ -326,26 +349,33 @@ class QwenImagePipeline(BasePipeline):
         self._text_encoder_parent = text_encoder  # Store parent model reference
         
         # Register forward hooks on each layer for block swapping
-        for i, layer in enumerate(layers):
-            def make_hook(layer_idx, offloader_ref):
-                def forward_pre_hook(module, input):
-                    # Wait for this block to be on GPU before forward
-                    offloader_ref.wait_for_block(layer_idx)
-                    return None
+        try:
+            for i, layer in enumerate(layers):
+                def make_hook(layer_idx, offloader_ref):
+                    def forward_pre_hook(module, input):
+                        # Wait for this block to be on GPU before forward
+                        offloader_ref.wait_for_block(layer_idx)
+                        return None
+                    
+                    def forward_hook(module, input, output):
+                        # Submit move for this block after forward (move to CPU, next to GPU)
+                        offloader_ref.submit_move_blocks_forward(layer_idx)
+                        return output
+                    
+                    return forward_pre_hook, forward_hook
                 
-                def forward_hook(module, input, output):
-                    # Submit move for this block after forward (move to CPU, next to GPU)
-                    offloader_ref.submit_move_blocks_forward(layer_idx)
-                    return output
-                
-                return forward_pre_hook, forward_hook
-            
-            pre_hook, post_hook = make_hook(i, offloader)
-            # Register pre-hook to wait for current block
-            handle_pre = layer.register_forward_pre_hook(pre_hook)
-            # Register post-hook to submit block move after forward
-            handle_post = layer.register_forward_hook(post_hook)
-            self._text_encoder_hooks.append((handle_pre, handle_post))
+                pre_hook, post_hook = make_hook(i, offloader)
+                # Register pre-hook to wait for current block
+                handle_pre = layer.register_forward_pre_hook(pre_hook)
+                # Register post-hook to submit block move after forward
+                handle_post = layer.register_forward_hook(post_hook)
+                self._text_encoder_hooks.append((handle_pre, handle_post))
+            print(f'[DEBUG] Registered {len(self._text_encoder_hooks)} forward hooks')
+        except Exception as e:
+            print(f'[ERROR] Failed to register forward hooks: {e}')
+            import traceback
+            traceback.print_exc()
+            raise
         
         print(f'Qwen text encoder block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
     

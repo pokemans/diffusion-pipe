@@ -263,13 +263,56 @@ class ModelOffloader(Offloader):
         if self.debug:
             print(f"[{self.block_type}] Prepare block devices before forward")
 
-        for b in self.blocks[0 : self.num_blocks - self.blocks_to_swap]:
-            b.to(self.device)
-            weights_to_device(b, self.device)  # make sure weights are on device
+        # Check if blocks are currently on CPU (common for text encoders)
+        # If so, we need to move them incrementally to avoid OOM
+        first_block_device = None
+        if len(self.blocks) > 0:
+            try:
+                first_param = next(self.blocks[0].parameters(), None)
+                if first_param is not None:
+                    first_block_device = first_param.device
+            except StopIteration:
+                pass
+        
+        blocks_on_cpu = first_block_device is not None and first_block_device.type == 'cpu'
+        
+        if self.debug:
+            print(f"[{self.block_type}] Blocks currently on CPU: {blocks_on_cpu}, blocks_to_swap: {self.blocks_to_swap}")
 
-        for b in self.blocks[self.num_blocks - self.blocks_to_swap :]:
-            b.to(self.device)  # move block to device first
-            weights_to_device(b, torch.device('cpu'))  # make sure weights are on cpu
+        # Move blocks that should stay on CUDA - do this incrementally to avoid OOM
+        blocks_to_keep_on_cuda = self.blocks[0 : self.num_blocks - self.blocks_to_swap]
+        for i, b in enumerate(blocks_to_keep_on_cuda):
+            if blocks_on_cpu:
+                # For blocks on CPU, move weights first (doesn't require moving structure)
+                # This is safer and avoids triggering parent model movement
+                try:
+                    weights_to_device(b, self.device)
+                    # Then move block structure - this should be safe now that weights are on CUDA
+                    b.to(self.device)
+                    if self.debug and i % 5 == 0:
+                        print(f"[{self.block_type}] Moved block {i} to CUDA")
+                except torch.cuda.OutOfMemoryError as e:
+                    if self.debug:
+                        print(f"[{self.block_type}] OOM while moving block {i}, cleaning cache and retrying")
+                    clean_memory_on_device(self.device)
+                    gc.collect()
+                    # Try again with just weights
+                    weights_to_device(b, self.device)
+            else:
+                b.to(self.device)
+                weights_to_device(b, self.device)  # make sure weights are on device
+
+        # Handle blocks that should be swapped (kept on CPU)
+        # These blocks should NOT be moved to CUDA at all
+        blocks_to_swap = self.blocks[self.num_blocks - self.blocks_to_swap :]
+        for b in blocks_to_swap:
+            if blocks_on_cpu:
+                # Blocks are already on CPU, just ensure weights are on CPU
+                weights_to_device(b, torch.device('cpu'))
+            else:
+                # Blocks are on CUDA, move structure to CPU first, then ensure weights are on CPU
+                b.to(torch.device('cpu'))
+                weights_to_device(b, torch.device('cpu'))
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
