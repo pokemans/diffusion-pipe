@@ -305,16 +305,41 @@ class QwenImagePipeline(BasePipeline):
             target_device = 'cpu' if text_encoder_cache_on_cpu else 'cuda'
             
             # Use same pattern as DatasetManager._handle_task() - check device before moving
+            # Only move if not already on target device
             try:
                 current_device_type = next(self.text_encoder.parameters()).device.type
                 if current_device_type != target_device:
                     # Move text encoder to target device
                     self.text_encoder.to(target_device)
-            except (StopIteration, RuntimeError) as e:
-                # Handle edge case: no parameters or meta tensor issue
-                # If we can't check device, try to move it anyway
-                # This should only happen if model is not properly initialized
-                self.text_encoder.to(target_device)
+                # else: already on target device, skip moving
+            except (StopIteration, RuntimeError):
+                # Handle edge case: meta tensor or no parameters
+                # Try to check if model was already moved by checking multiple parameters
+                try:
+                    # Check a few parameters to see if any are on target device
+                    params_checked = 0
+                    for param in self.text_encoder.parameters():
+                        if params_checked >= 5:  # Check up to 5 parameters
+                            break
+                        try:
+                            if param.device.type == target_device:
+                                # Found a parameter on target device, assume model is already moved
+                                break
+                        except RuntimeError:
+                            # Meta tensor, skip
+                            continue
+                        params_checked += 1
+                    else:
+                        # No parameters found on target device, try to move
+                        # But this will fail if there are meta tensors
+                        # In this case, the model likely wasn't fully loaded
+                        self.text_encoder.to(target_device)
+                except Exception:
+                    # If we can't determine device and can't move, raise informative error
+                    raise RuntimeError(
+                        'Cannot determine text encoder device. Some parameters may be on meta device. '
+                        'Ensure text encoder is fully loaded before caching sample prompts.'
+                    )
         
         # Encode prompts
         prompt_embeds = self._get_qwen_prompt_embeds(
