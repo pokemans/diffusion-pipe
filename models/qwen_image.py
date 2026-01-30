@@ -791,6 +791,7 @@ class QwenImagePipeline(BasePipeline):
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         """
         Generate sample images from text prompts using flow matching sampling.
+        Processes prompts sequentially to minimize VRAM usage.
         
         Args:
             prompts: List of text prompts
@@ -806,12 +807,6 @@ class QwenImagePipeline(BasePipeline):
         import torchvision
         import numpy as np
         
-        # Set random seed
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        
         # Get device and dtype
         device = next(self.transformer.parameters()).device
         dtype = self.model_config['dtype']
@@ -819,6 +814,8 @@ class QwenImagePipeline(BasePipeline):
         # Round height/width to multiple of pixels_round_to_multiple (32)
         height = ((height + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
         width = ((width + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
+
+        print(f'Generating samples for {len(prompts)} prompt(s) with height {height} and width {width}')
         
         # Calculate latent dimensions (packing reduces spatial dims by 2)
         latent_h = height // 2
@@ -827,168 +824,156 @@ class QwenImagePipeline(BasePipeline):
         # Get num_channels_latents from transformer config
         num_channels_latents = self.transformer.config.in_channels // 4
         
-        # Ensure transformer is loaded
-        if not hasattr(self, 'transformer') or self.transformer is None:
-            self.load_diffusion_model()
-        
-        # Prepare for inference
+        # Prepare for inference (once, reused for all prompts)
         self.transformer.eval()
         self.prepare_block_swap_inference(disable_block_swap=False)
         
-        # Check if we have cached prompt embeddings
-        if (hasattr(self, 'sample_prompt_embeds') and 
-            self.sample_prompt_embeds is not None and
-            hasattr(self, 'sample_prompts') and
-            self.sample_prompts == prompts):
-            # Use cached embeddings - move to device if needed
-            prompt_embeds_list = [
-                emb.to(device) if isinstance(emb, torch.Tensor) and emb.device != device else emb
-                for emb in self.sample_prompt_embeds
-            ]
-        else:
-            # Encode prompts (cache miss or not cached)
-            prompt_embeds_list = self._get_qwen_prompt_embeds(
-                prompts,
-                control_files=None,
-                device=device
-            )
-        
-        # Pad prompt embeds to same length (same as prepare_inputs does)
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.bool, device=device) for e in prompt_embeds_list]
-        max_seq_len = max([e.size(0) for e in prompt_embeds_list])
-        prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in prompt_embeds_list]
-        ).to(device, dtype)
-        prompt_embeds_mask = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
-        ).to(device)
-        
-        max_text_len = prompt_embeds_mask.sum(dim=1).max().item()
-        prompt_embeds = prompt_embeds[:, :max_text_len, :]
-        prompt_embeds_mask = prompt_embeds_mask[:, :max_text_len]
-        
-        # Initialize latents with random noise (unpacked format: bs, c, f, h, w)
-        bs = len(prompts)
-        num_frames = 1  # For images
-        # Start with noise x_0 (at t=1, we have pure noise)
-        x_0 = torch.randn(bs, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
-        # Current state x_t starts as x_0
-        x_t = x_0.clone()
-        
-        # Calculate expected sequence length for packed latents: (latent_h // 2) * (latent_w // 2) * num_frames
-        # This is constant across iterations, so we can create attention masks once
-        expected_img_seq_len = (latent_h // 2) * (latent_w // 2) * num_frames
-        
-        # Create attention masks once before the loop (they don't change between iterations)
-        img_attention_mask = torch.ones((bs, expected_img_seq_len), dtype=torch.bool, device=device)
-        attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
-        attention_mask = attention_mask.view(bs, 1, 1, -1)
-        
-        # Flow matching sampling: Euler steps from t=1.0 to t=0.0
-        dt = 1.0 / num_inference_steps
-        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
-        
-        with torch.no_grad():
-            for i in range(num_inference_steps):
-                t = timesteps[i]
-                
-                # Pack current state for model input: (bs, c, f, h, w) -> (bs, seq_len, hidden_dim)
-                x_t_packed = self._pack_latents(x_t, bs, num_channels_latents, latent_h, latent_w)
-                
-                # The model is trained to predict target = x_0 - x_1 given x_t
-                # We use x_t directly and let the model predict the velocity field
-                # Attention mask is already prepared above (reused for all iterations)
-                
-                # Prepare img_shapes and txt_seq_lens
-                img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device).repeat((bs, 1, 1))
-                txt_seq_lens = torch.tensor([max_text_len], dtype=torch.int32, device=device).repeat((bs,))
-                
-                # Transform t according to model config (same as prepare_inputs)
-                t_for_model = t.expand(bs).to(dtype)
-                timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
-                
-                # Note: prepare_inputs applies sigmoid to sampled values, but we already have t in [0,1]
-                # So we skip the sigmoid step since t is already in the correct range
-                # But we still apply shift if configured
-                if shift := self.model_config.get('shift', None):
-                    t_for_model = (t_for_model * shift) / (1 + (shift - 1) * t_for_model)
-                elif self.model_config.get('flux_shift', False):
-                    mu = get_lin_function(y1=0.5, y2=1.15)((latent_h // 2) * (latent_w // 2))
-                    t_for_model = time_shift(mu, 1.0, t_for_model)
-                
-                # Forward through layers
-                model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
-                layers = self.to_layers()
-                x = model_inputs
-                for layer in layers:
-                    x = layer(x)
-                
-                # x is the predicted target = x_0 - x_1 (packed format)
-                predicted_target_packed = x
-                
-                # Unpack predicted target: (bs, seq_len, hidden_dim) -> (bs, c, f, h, w)
-                predicted_target = self._unpack_latents(predicted_target_packed, bs, num_channels_latents, latent_h, latent_w)
-                
-                # Flow matching ODE: dx/dt = v_t(x) where v_t(x_t) = x_0 - x_1
-                # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
-                # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
-                x_t = x_t - dt * predicted_target
-                
-                # Explicitly delete intermediate tensors to free VRAM
-                del x_t_packed, predicted_target_packed, predicted_target
-                
-                # Clear CUDA cache periodically to reduce fragmentation (every 5 iterations)
-                if (i + 1) % 5 == 0:
-                    torch.cuda.empty_cache()
-        
-        # After sampling, x_t should be close to x_1 (clean latents)
-        latents = x_t
-        
-        # Decode latents with VAE
+        # Prepare VAE (once, reused for all prompts)
         vae = self.get_vae()
         vae.eval()
         vae.to(device)
         
-        # Reverse normalization: latents = latents * std + mean
-        # Latents are in unpacked format: (bs, c, f, h, w)
-        # VAE expects (bs, c, h, w) for images, so remove frame dimension
-        latents_for_vae = latents.squeeze(2)  # Remove frame dimension: (bs, c, h, w)
+        print(f'VAE is prepared')
         
-        # Reverse normalization: latents_mean_tensor and latents_std_tensor have shape (1, z_dim, 1, 1, 1)
-        # Squeeze frame dimension to get (1, z_dim, 1, 1) which broadcasts with (bs, c, h, w)
+        # Pre-compute constants
+        num_frames = 1  # For images
+        expected_img_seq_len = (latent_h // 2) * (latent_w // 2) * num_frames
+        dt = 1.0 / num_inference_steps
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+        
+        # Mean and std tensors for VAE normalization (reused for all prompts)
         mean_tensor = self.vae.latents_mean_tensor.squeeze(2)  # (1, z_dim, 1, 1)
         std_tensor = self.vae.latents_std_tensor.squeeze(2)  # (1, z_dim, 1, 1)
-        latents_for_vae = latents_for_vae * std_tensor + mean_tensor
         
-        # Decode with VAE - diffusers VAE expects (B, C, H, W)
-        with torch.no_grad():
-            decoded = self.vae.decode(latents_for_vae.to(vae.device, vae.dtype))
+        images = []
+        
+        # Process each prompt sequentially
+        for prompt_idx, prompt in enumerate(prompts):
+            print(f'Processing prompt {prompt_idx + 1}/{len(prompts)}: {prompt}')
             
-            # Handle VAE output
-            if hasattr(decoded, 'sample'):
-                decoded = decoded.sample
-            elif isinstance(decoded, dict):
-                decoded = decoded['sample']
+            # Set random seed for this prompt (seed + prompt_idx for different results)
+            current_seed = seed + prompt_idx
+            torch.manual_seed(current_seed)
+            np.random.seed(current_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(current_seed)
             
-            # Ensure format is (B, C, H, W)
-            if decoded.dim() == 4 and decoded.shape[-1] == 3:
-                decoded = decoded.movedim(-1, 1)
+            # Encode single prompt
+            prompt_embeds_list = self._get_qwen_prompt_embeds(
+                [prompt],
+                control_files=None,
+                device=device
+            )
+            prompt_embeds_single = prompt_embeds_list[0]  # Single prompt, no padding needed
+            prompt_embeds_single = prompt_embeds_single.to(device, dtype)
             
-            # Convert to PIL images
-            images = []
-            for i in range(len(prompts)):
-                img = decoded[i].cpu().float()
+            # Create attention mask for single prompt
+            max_text_len = prompt_embeds_single.size(0)
+            prompt_embeds_mask_single = torch.ones(max_text_len, dtype=torch.bool, device=device)
+            
+            # Reshape prompt_embeds for model input: add batch dimension
+            prompt_embeds = prompt_embeds_single.unsqueeze(0)  # (1, seq_len, hidden_dim)
+            prompt_embeds_mask = prompt_embeds_mask_single.unsqueeze(0)  # (1, seq_len)
+            
+            # Initialize latents with random noise (batch size = 1)
+            x_t = torch.randn(1, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
+            
+            # Create attention mask for single prompt (batch size = 1)
+            img_attention_mask = torch.ones((1, expected_img_seq_len), dtype=torch.bool, device=device)
+            attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
+            attention_mask = attention_mask.view(1, 1, 1, -1)
+            
+            # Flow matching sampling: Euler steps from t=1.0 to t=0.0
+            with torch.no_grad():
+                print(f'Starting sampling loop')
+                for i in range(num_inference_steps):
+                    t = timesteps[i]
+                    
+                    # Pack current state for model input: (1, c, f, h, w) -> (1, seq_len, hidden_dim)
+                    x_t_packed = self._pack_latents(x_t, 1, num_channels_latents, latent_h, latent_w)
+                    
+                    # Prepare img_shapes and txt_seq_lens (batch size = 1)
+                    img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device)
+                    txt_seq_lens = torch.tensor([max_text_len], dtype=torch.int32, device=device)
+                    
+                    # Transform t according to model config
+                    t_for_model = t.expand(1).to(dtype)
+                    timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+                    
+                    if shift := self.model_config.get('shift', None):
+                        t_for_model = (t_for_model * shift) / (1 + (shift - 1) * t_for_model)
+                    elif self.model_config.get('flux_shift', False):
+                        mu = get_lin_function(y1=0.5, y2=1.15)((latent_h // 2) * (latent_w // 2))
+                        t_for_model = time_shift(mu, 1.0, t_for_model)
+                    
+                    # Forward through layers
+                    model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
+                    layers = self.to_layers()
+                    x = model_inputs
+                    for layer in layers:
+                        x = layer(x)
+                    
+                    # x is the predicted target = x_0 - x_1 (packed format)
+                    predicted_target_packed = x
+                    
+                    # Unpack predicted target: (1, seq_len, hidden_dim) -> (1, c, f, h, w)
+                    predicted_target = self._unpack_latents(predicted_target_packed, 1, num_channels_latents, latent_h, latent_w)
+                    
+                    # Flow matching ODE: dx/dt = v_t(x) where v_t(x_t) = x_0 - x_1
+                    # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
+                    # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
+                    x_t = x_t - dt * predicted_target
+                    
+                    # Explicitly delete intermediate tensors to free VRAM
+                    del x_t_packed, predicted_target_packed, predicted_target
+                    
+                    # Clear CUDA cache periodically to reduce fragmentation (every 5 iterations)
+                    if (i + 1) % 5 == 0:
+                        torch.cuda.empty_cache()
+            
+            # After sampling, x_t should be close to x_1 (clean latents)
+            latents = x_t
+            
+            # Reverse normalization: latents = latents * std + mean
+            # Latents are in unpacked format: (1, c, f, h, w)
+            # VAE expects (1, c, h, w) for images, so remove frame dimension
+            latents_for_vae = latents.squeeze(2)  # Remove frame dimension: (1, c, h, w)
+            latents_for_vae = latents_for_vae * std_tensor + mean_tensor
+            
+            # Decode with VAE - diffusers VAE expects (B, C, H, W)
+            with torch.no_grad():
+                print(f'Decoding with VAE')
+                decoded = self.vae.decode(latents_for_vae.to(vae.device, vae.dtype))
+                print(f'VAE decoded')
+                # Handle VAE output
+                if hasattr(decoded, 'sample'):
+                    decoded = decoded.sample
+                elif isinstance(decoded, dict):
+                    decoded = decoded['sample']
+                
+                # Ensure format is (B, C, H, W)
+                if decoded.dim() == 4 and decoded.shape[-1] == 3:
+                    decoded = decoded.movedim(-1, 1)
+                
+                # Convert to PIL image (single image, batch size = 1)
+                img = decoded[0].cpu().float()
                 # VAE output is typically in range [-1, 1], convert to [0, 1]
                 img = (img + 1) / 2
                 img = img.clamp(0, 1)
                 # Convert to PIL
                 pil_img = torchvision.transforms.functional.to_pil_image(img)
                 images.append(pil_img)
+                
+                # Delete decoded tensor and latents to free VRAM
+                del decoded, latents_for_vae, latents
             
-            # Delete decoded tensor to free VRAM
-            del decoded, latents_for_vae
+            # Clean up prompt embeddings and other temporary tensors
+            del prompt_embeds_single, prompt_embeds, prompt_embeds_mask, attention_mask, x_t, img_attention_mask
+            
+            # Clear CUDA cache after each prompt
+            torch.cuda.empty_cache()
         
-        # Clear CUDA cache after VAE decoding
+        # Clear CUDA cache after all prompts are processed
         # Note: VAE device cleanup is handled by train.py's finally block
         torch.cuda.empty_cache()
         
