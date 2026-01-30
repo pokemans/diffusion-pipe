@@ -1089,7 +1089,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
-    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
+    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, text_encoder_cache_on_cpu=False):
         self.model = model
         self.vae = self.model.get_vae()
         self.text_encoders = self.model.get_text_encoders()
@@ -1103,6 +1103,7 @@ class DatasetManager:
         self.regenerate_cache = regenerate_cache
         self.trust_cache = trust_cache
         self.caching_batch_size = caching_batch_size
+        self.text_encoder_cache_on_cpu = text_encoder_cache_on_cpu
         self.datasets = []
 
     def register(self, dataset):
@@ -1177,11 +1178,13 @@ class DatasetManager:
         # moved needed submodel to cuda, and everything else to cpu
         submodel = self.submodels[id]
         if isinstance(submodel, nn.Module):
-            if next(self.submodels[id].parameters()).device.type != 'cuda':
+            # For text encoders (id > 0), check if we should use CPU instead of CUDA
+            target_device = 'cpu' if (id > 0 and self.text_encoder_cache_on_cpu) else 'cuda'
+            if next(self.submodels[id].parameters()).device.type != target_device:
                 for i, submodel in enumerate(self.submodels):
                     if i != id:
                         submodel.to('cpu')
-                self.submodels[id].to('cuda')
+                self.submodels[id].to(target_device)
         else:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.
             self.submodels[id].load_model_if_needed()

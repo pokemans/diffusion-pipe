@@ -138,6 +138,7 @@ def set_config_defaults(config):
     config.setdefault('eval_before_first_step', True)
     config.setdefault('compile', False)
     config.setdefault('x_axis_examples', False)
+    config.setdefault('text_encoder_cache_on_cpu', False)
 
     # Sample generation config
     if 'sample_generation' in config:
@@ -493,7 +494,8 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size)
+    text_encoder_cache_on_cpu = config.get('text_encoder_cache_on_cpu', False)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, text_encoder_cache_on_cpu=text_encoder_cache_on_cpu)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)
