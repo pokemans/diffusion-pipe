@@ -389,14 +389,14 @@ def single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=No
     return x
 
 
-def patch_layernorm_for_block_swapping():
+def patch_modules_for_block_swapping():
     """
-    Patch transformers library LayerNorm forward method to handle device mismatches
+    Patch transformers library modules (LayerNorm, Linear) to handle device mismatches
     that occur during text encoder block swapping.
     
-    When blocks are selectively moved to CUDA, LayerNorm's self.weight might remain
-    on CPU even though the input hidden_states is on CUDA. This patch ensures
-    self.weight is moved to the same device as the input before computation.
+    When blocks are selectively moved to CUDA, module parameters (weight, bias) might remain
+    on CPU even though the input is on CUDA. These patches ensure parameters are moved to
+    the same device as the input before computation.
     
     This is Solution A from the block swapping device mismatch fix plan.
     """
@@ -419,7 +419,7 @@ def patch_layernorm_for_block_swapping():
         # Qwen2RMSNorm might not be available or might use different LayerNorm
         pass
     
-    # Also patch standard PyTorch LayerNorm used by transformers
+    # Patch standard PyTorch LayerNorm used by transformers
     try:
         original_layernorm_forward = nn.LayerNorm.forward
         
@@ -435,6 +435,26 @@ def patch_layernorm_for_block_swapping():
         
         nn.LayerNorm.forward = patched_layernorm_forward
         print("[PATCH] Applied device mismatch fix to nn.LayerNorm.forward")
+    except Exception as e:
+        # If patching fails, continue without it
+        pass
+    
+    # Patch Linear layers (q_proj, k_proj, v_proj, o_proj, etc.)
+    try:
+        original_linear_forward = nn.Linear.forward
+        
+        def patched_linear_forward(self, input):
+            # Ensure weight and bias are on same device as input
+            if hasattr(self, 'weight') and self.weight is not None:
+                if self.weight.device != input.device:
+                    self.weight.data = self.weight.data.to(input.device, non_blocking=False)
+            if hasattr(self, 'bias') and self.bias is not None:
+                if self.bias.device != input.device:
+                    self.bias.data = self.bias.data.to(input.device, non_blocking=False)
+            return original_linear_forward(self, input)
+        
+        nn.Linear.forward = patched_linear_forward
+        print("[PATCH] Applied device mismatch fix to nn.Linear.forward")
     except Exception as e:
         # If patching fails, continue without it
         pass
@@ -473,5 +493,5 @@ def apply_patches():
     DoubleStreamBlock.forward = double_stream_forward
     SingleStreamBlock.forward = single_stream_forward
     
-    # Patch LayerNorm to handle device mismatches during block swapping
-    patch_layernorm_for_block_swapping()
+    # Patch modules (LayerNorm, Linear) to handle device mismatches during block swapping
+    patch_modules_for_block_swapping()

@@ -1103,6 +1103,22 @@ class ModelOffloader(Offloader):
                 _ = param.device  # Force device property access to refresh PyTorch's cache
                 _ = param.data.device  # Force data device access
             
+            # Explicitly check attention modules (q_proj, k_proj, v_proj, o_proj) as defensive measure
+            # These are commonly accessed and might have device mismatches
+            if hasattr(parent_layer, 'self_attn'):
+                self_attn = parent_layer.self_attn
+                for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                    if hasattr(self_attn, proj_name):
+                        proj = getattr(self_attn, proj_name)
+                        if hasattr(proj, 'weight') and proj.weight.device.type != self.device.type:
+                            if self.debug:
+                                print(f"[{self.block_type}] Moving {proj_name}.weight from {proj.weight.device.type} to {self.device.type}")
+                            proj.weight.data = proj.weight.data.to(self.device, non_blocking=False)
+                            if hasattr(proj, 'bias') and proj.bias is not None:
+                                if proj.bias.device.type != self.device.type:
+                                    proj.bias.data = proj.bias.data.to(self.device, non_blocking=False)
+                            proj.to(self.device)
+            
             if self.debug:
                 print(f"[{self.block_type}] Parent structure device sync completed for block {block_idx}")
         
