@@ -144,6 +144,12 @@ class QwenDoubleStreamAttnProcessor2_0:
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+        
+        # Save dtype before deleting tensors (needed for later conversion)
+        query_dtype = joint_query.dtype
+        
+        # Delete individual QKV tensors after concatenation to free VRAM
+        del img_query, img_key, img_value, txt_query, txt_key, txt_value
 
         # Compute joint attention
         joint_hidden_states = dispatch_attention_fn(
@@ -155,14 +161,20 @@ class QwenDoubleStreamAttnProcessor2_0:
             is_causal=False,
             backend=self._attention_backend,
         )
+        
+        # Delete joint QKV tensors after attention computation to free VRAM
+        del joint_query, joint_key, joint_value
 
         # Reshape back
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
-        joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
+        joint_hidden_states = joint_hidden_states.to(query_dtype)
 
         # Split attention outputs back
         txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
         img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
+        
+        # Delete joint_hidden_states after splitting to free VRAM
+        del joint_hidden_states
 
         # Apply output projections
         img_attn_output = attn.to_out[0](img_attn_output)
@@ -863,6 +875,15 @@ class QwenImagePipeline(BasePipeline):
         # Current state x_t starts as x_0
         x_t = x_0.clone()
         
+        # Calculate expected sequence length for packed latents: (latent_h // 2) * (latent_w // 2) * num_frames
+        # This is constant across iterations, so we can create attention masks once
+        expected_img_seq_len = (latent_h // 2) * (latent_w // 2) * num_frames
+        
+        # Create attention masks once before the loop (they don't change between iterations)
+        img_attention_mask = torch.ones((bs, expected_img_seq_len), dtype=torch.bool, device=device)
+        attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
+        attention_mask = attention_mask.view(bs, 1, 1, -1)
+        
         # Flow matching sampling: Euler steps from t=1.0 to t=0.0
         dt = 1.0 / num_inference_steps
         timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
@@ -876,10 +897,7 @@ class QwenImagePipeline(BasePipeline):
                 
                 # The model is trained to predict target = x_0 - x_1 given x_t
                 # We use x_t directly and let the model predict the velocity field
-                # Prepare attention mask
-                img_attention_mask = torch.ones((bs, x_t_packed.shape[1]), dtype=torch.bool, device=device)
-                attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
-                attention_mask = attention_mask.view(bs, 1, 1, -1)
+                # Attention mask is already prepared above (reused for all iterations)
                 
                 # Prepare img_shapes and txt_seq_lens
                 img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device).repeat((bs, 1, 1))
@@ -915,6 +933,13 @@ class QwenImagePipeline(BasePipeline):
                 # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
                 # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
                 x_t = x_t - dt * predicted_target
+                
+                # Explicitly delete intermediate tensors to free VRAM
+                del x_t_packed, predicted_target_packed, predicted_target
+                
+                # Clear CUDA cache periodically to reduce fragmentation (every 5 iterations)
+                if (i + 1) % 5 == 0:
+                    torch.cuda.empty_cache()
         
         # After sampling, x_t should be close to x_1 (clean latents)
         latents = x_t
@@ -959,6 +984,13 @@ class QwenImagePipeline(BasePipeline):
                 # Convert to PIL
                 pil_img = torchvision.transforms.functional.to_pil_image(img)
                 images.append(pil_img)
+            
+            # Delete decoded tensor to free VRAM
+            del decoded, latents_for_vae
+        
+        # Clear CUDA cache after VAE decoding
+        # Note: VAE device cleanup is handled by train.py's finally block
+        torch.cuda.empty_cache()
         
         return images
         
