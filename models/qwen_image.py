@@ -303,8 +303,18 @@ class QwenImagePipeline(BasePipeline):
             # No block swapping - respect text_encoder_cache_on_cpu config
             text_encoder_cache_on_cpu = self.config.get('text_encoder_cache_on_cpu', False)
             target_device = 'cpu' if text_encoder_cache_on_cpu else 'cuda'
-            # Move entire text encoder to target device
-            self.text_encoder.to(target_device)
+            
+            # Use same pattern as DatasetManager._handle_task() - check device before moving
+            try:
+                current_device_type = next(self.text_encoder.parameters()).device.type
+                if current_device_type != target_device:
+                    # Move text encoder to target device
+                    self.text_encoder.to(target_device)
+            except (StopIteration, RuntimeError) as e:
+                # Handle edge case: no parameters or meta tensor issue
+                # If we can't check device, try to move it anyway
+                # This should only happen if model is not properly initialized
+                self.text_encoder.to(target_device)
         
         # Encode prompts
         prompt_embeds = self._get_qwen_prompt_embeds(
