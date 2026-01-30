@@ -927,6 +927,8 @@ class QwenImagePipeline(BasePipeline):
             # Reshape prompt_embeds for model input: add batch dimension
             prompt_embeds = prompt_embeds_single.unsqueeze(0)  # (1, seq_len, hidden_dim)
             prompt_embeds_mask = prompt_embeds_mask_single.unsqueeze(0)  # (1, seq_len)
+
+            del prompt_embeds_single, prompt_embeds_mask_single
             
             # Initialize latents with random noise (batch size = 1)
             x_t = torch.randn(1, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
@@ -936,6 +938,7 @@ class QwenImagePipeline(BasePipeline):
             attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
             attention_mask = attention_mask.view(1, 1, 1, -1)
             
+            del prompt_embeds_mask, img_attention_mask
             # Flow matching sampling: Euler steps from t=1.0 to t=0.0
             with torch.no_grad():
                 print(f'Starting sampling loop')
@@ -961,24 +964,24 @@ class QwenImagePipeline(BasePipeline):
                     
                     # Forward through layers
                     model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
+                    del attention_mask, prompt_embeds, t_for_model, img_shapes, txt_seq_lens
                     layers = self.to_layers()
-                    x = model_inputs
+                    predicted_target_packed = model_inputs
                     for layer in layers:
-                        x = layer(x)
+                        predicted_target_packed = layer(predicted_target_packed)
                     
-                    # x is the predicted target = x_0 - x_1 (packed format)
-                    predicted_target_packed = x
+                    del layers, model_inputs
                     
                     # Unpack predicted target: (1, seq_len, hidden_dim) -> (1, c, f, h, w)
                     predicted_target = self._unpack_latents(predicted_target_packed, 1, num_channels_latents, latent_h, latent_w)
-                    
+                    del predicted_target_packed
                     # Flow matching ODE: dx/dt = v_t(x) where v_t(x_t) = x_0 - x_1
                     # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
                     # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
                     x_t = x_t - dt * predicted_target
                     
                     # Explicitly delete intermediate tensors to free VRAM
-                    del x_t_packed, predicted_target_packed, predicted_target
+                    del x_t_packed, predicted_target
                     
                     # Clear CUDA cache periodically to reduce fragmentation (every 5 iterations)
                     if (i + 1) % 5 == 0:
@@ -1030,7 +1033,7 @@ class QwenImagePipeline(BasePipeline):
                 del decoded, latents_for_vae, latents
             
             # Clean up prompt embeddings and other temporary tensors
-            del prompt_embeds_single, prompt_embeds, prompt_embeds_mask, attention_mask, x_t, img_attention_mask
+            del prompt_embeds_single, prompt_embeds, x_t, img_attention_mask
             # Clear CUDA cache after each prompt
             torch.cuda.empty_cache()
         
