@@ -289,8 +289,29 @@ class QwenImagePipeline(BasePipeline):
         if prompts is None or len(prompts) == 0:
             return
         
-        # Encode prompts using the same method as dataset caching
-        prompt_embeds = self._get_qwen_prompt_embeds(prompts, control_files=None, device=self.text_encoder.device)
+        # Check if block swapping is enabled
+        use_block_swap = (self.text_encoder_offloader is not None and 
+                         self.text_encoder_offloader.blocks_to_swap is not None and 
+                         self.text_encoder_offloader.blocks_to_swap > 0)
+        
+        if use_block_swap:
+            # Use existing block swap mechanism - this calls prepare_block_devices_before_forward()
+            # which ensures all blocks are properly on CUDA device
+            self.prepare_text_encoder_block_swap_inference(disable_block_swap=False)
+            target_device = 'cuda'  # Block swapping requires CUDA
+        else:
+            # No block swapping - respect text_encoder_cache_on_cpu config
+            text_encoder_cache_on_cpu = self.config.get('text_encoder_cache_on_cpu', False)
+            target_device = 'cpu' if text_encoder_cache_on_cpu else 'cuda'
+            # Move entire text encoder to target device
+            self.text_encoder.to(target_device)
+        
+        # Encode prompts
+        prompt_embeds = self._get_qwen_prompt_embeds(
+            prompts, 
+            control_files=None, 
+            device=target_device
+        )
         
         # Store prompts and their embeddings
         self.sample_prompts = prompts
@@ -395,7 +416,7 @@ class QwenImagePipeline(BasePipeline):
         device=None,
         dtype=None,
     ):
-        device = device or self._execution_device
+        device = device or getattr(self, '_execution_device', torch.device('cuda'))
         dtype = dtype or self.text_encoder.dtype
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -410,7 +431,7 @@ class QwenImagePipeline(BasePipeline):
             txt_tokens = self.tokenizer(
                 txt, max_length=self.tokenizer_max_length + drop_idx, padding=True, truncation=True, return_tensors="pt"
             ).to(device)
-            attention_mask = txt_tokens.attention_mask
+            attention_mask = txt_tokens.attention_mask.to(device)
             
             if use_block_swap:
                 # Manual forward pass with block swapping
@@ -439,7 +460,7 @@ class QwenImagePipeline(BasePipeline):
                 padding=True,
                 return_tensors="pt",
             ).to(device)
-            attention_mask = model_inputs.attention_mask
+            attention_mask = model_inputs.attention_mask.to(device)
             
             if use_block_swap:
                 # Manual forward pass with block swapping
