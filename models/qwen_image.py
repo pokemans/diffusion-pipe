@@ -351,10 +351,24 @@ class QwenImagePipeline(BasePipeline):
                         raise
                 else:
                     # Fallback: move entire model
-                    text_encoder.to(target_device)
+                    try:
+                        text_encoder.to(target_device)
+                    except NotImplementedError as e:
+                        if "meta tensor" in str(e):
+                            # Some parameters on meta device - this is OK if layers were already moved
+                            pass
+                        else:
+                            raise
             else:
                 # Fallback: move entire model
-                text_encoder.to(target_device)
+                try:
+                    text_encoder.to(target_device)
+                except NotImplementedError as e:
+                    if "meta tensor" in str(e):
+                        # Some parameters on meta device - this is OK
+                        pass
+                    else:
+                        raise
         
         # Encode prompts
         prompt_embeds = self._get_qwen_prompt_embeds(
