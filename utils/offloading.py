@@ -1089,6 +1089,23 @@ class ModelOffloader(Offloader):
                         if self.debug:
                             print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight confirmed on {weight_device}, called input_layernorm.to({self.device}) to sync module state")
         
+        # Solution B: Force parent structure device sync
+        # After moving blocks, ensure parent model structure recognizes device changes
+        # This helps synchronize PyTorch's internal state when blocks are part of a larger model
+        if self.parent_layers is not None and block_idx < len(self.parent_layers):
+            parent_layer = self.parent_layers[block_idx]
+            if self.debug:
+                print(f"[{self.block_type}] Forcing parent structure device sync for block {block_idx}")
+            
+            # Force sync by accessing all parameters in parent layer
+            # This ensures PyTorch refreshes its internal device tracking
+            for name, param in parent_layer.named_parameters():
+                _ = param.device  # Force device property access to refresh PyTorch's cache
+                _ = param.data.device  # Force data device access
+            
+            if self.debug:
+                print(f"[{self.block_type}] Parent structure device sync completed for block {block_idx}")
+        
         # Final explicit CUDA synchronization before forward pass
         # This ensures all parameter moves are complete and visible before the forward pass executes
         if self.device.type == 'cuda':

@@ -389,6 +389,57 @@ def single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=No
     return x
 
 
+def patch_layernorm_for_block_swapping():
+    """
+    Patch transformers library LayerNorm forward method to handle device mismatches
+    that occur during text encoder block swapping.
+    
+    When blocks are selectively moved to CUDA, LayerNorm's self.weight might remain
+    on CPU even though the input hidden_states is on CUDA. This patch ensures
+    self.weight is moved to the same device as the input before computation.
+    
+    This is Solution A from the block swapping device mismatch fix plan.
+    """
+    # Patch Qwen2RMSNorm (used by Qwen2 models)
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+        original_forward = Qwen2RMSNorm.forward
+        
+        def patched_forward(self, hidden_states):
+            # Ensure weight is on same device as input
+            if hasattr(self, 'weight') and self.weight is not None:
+                if self.weight.device != hidden_states.device:
+                    # Move weight to input device - this fixes the device mismatch error
+                    self.weight.data = self.weight.data.to(hidden_states.device, non_blocking=False)
+            return original_forward(self, hidden_states)
+        
+        Qwen2RMSNorm.forward = patched_forward
+        print("[PATCH] Applied device mismatch fix to Qwen2RMSNorm.forward")
+    except (ImportError, AttributeError) as e:
+        # Qwen2RMSNorm might not be available or might use different LayerNorm
+        pass
+    
+    # Also patch standard PyTorch LayerNorm used by transformers
+    try:
+        original_layernorm_forward = nn.LayerNorm.forward
+        
+        def patched_layernorm_forward(self, input):
+            # Ensure weight and bias are on same device as input
+            if hasattr(self, 'weight') and self.weight is not None:
+                if self.weight.device != input.device:
+                    self.weight.data = self.weight.data.to(input.device, non_blocking=False)
+            if hasattr(self, 'bias') and self.bias is not None:
+                if self.bias.device != input.device:
+                    self.bias.data = self.bias.data.to(input.device, non_blocking=False)
+            return original_layernorm_forward(self, input)
+        
+        nn.LayerNorm.forward = patched_layernorm_forward
+        print("[PATCH] Applied device mismatch fix to nn.LayerNorm.forward")
+    except Exception as e:
+        # If patching fails, continue without it
+        pass
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
@@ -421,3 +472,6 @@ def apply_patches():
     # Fix training issues caused by in-place tensor modification and backward pass (+= operations).
     DoubleStreamBlock.forward = double_stream_forward
     SingleStreamBlock.forward = single_stream_forward
+    
+    # Patch LayerNorm to handle device mismatches during block swapping
+    patch_layernorm_for_block_swapping()
