@@ -620,7 +620,10 @@ class QwenImagePipeline(BasePipeline):
         def fn(caption, is_video, control_file: list[str] | None):
             # args are lists
             assert not any(is_video)
-            prompt_embeds = self._get_qwen_prompt_embeds(caption, control_file, device=text_encoder.device)
+            # Always use CUDA - block swapping will handle moving blocks as needed
+            # text_encoder.device might incorrectly report CPU when blocks are partially offloaded
+            # but inputs should always be on CUDA during caching (when block swapping is active)
+            prompt_embeds = self._get_qwen_prompt_embeds(caption, control_file, device='cuda')
             return {'prompt_embeds': prompt_embeds}
         return fn
 
