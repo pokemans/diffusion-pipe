@@ -638,6 +638,7 @@ if __name__ == '__main__':
 
     # Text encoder block swapping
     text_encoder_blocks_to_swap = config.get('text_encoder_blocks_to_swap', 0)
+    print(f'[DEBUG] Checking text_encoder_blocks_to_swap: value={text_encoder_blocks_to_swap}, type={type(text_encoder_blocks_to_swap)}')
     if text_encoder_blocks_to_swap > 0:
         print(f'[DEBUG] Enabling text encoder block swapping with {text_encoder_blocks_to_swap} blocks')
         try:
