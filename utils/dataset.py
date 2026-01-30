@@ -1105,6 +1105,8 @@ class DatasetManager:
         self.trust_cache = trust_cache
         self.caching_batch_size = caching_batch_size
         self.datasets = []
+        # Check if text encoder block swapping is enabled
+        self.text_encoder_offloaders = getattr(model, 'text_encoder_offloaders', None)
 
     def register(self, dataset):
         self.datasets.append(dataset)
@@ -1151,6 +1153,18 @@ class DatasetManager:
         if unload_models:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
             # TODO: check if this is actually freeing memory.
+            # Clean up text encoder block swapping if enabled
+            if self.text_encoder_offloaders is not None:
+                # Remove hooks first (Qwen-specific)
+                if hasattr(self.model, '_remove_text_encoder_hooks'):
+                    self.model._remove_text_encoder_hooks()
+                for i, offloader in enumerate(self.text_encoder_offloaders):
+                    if offloader is not None:
+                        # Ensure all blocks are moved to CPU
+                        offloader.disable_block_swap()
+                        # Move all blocks to CPU explicitly
+                        for block in offloader.blocks:
+                            block.to('cpu')
             for model in self.submodels:
                 if not isinstance(model, nn.Module):
                     continue
@@ -1185,6 +1199,13 @@ class DatasetManager:
                 # Clear CUDA cache and run garbage collection before moving model to CUDA
                 gc.collect()
                 empty_cuda_cache()
+                # If this is a text encoder and block swapping is enabled, prepare block devices
+                if id > 0 and self.text_encoder_offloaders is not None:
+                    text_encoder_idx = id - 1
+                    if (text_encoder_idx < len(self.text_encoder_offloaders) and 
+                        self.text_encoder_offloaders[text_encoder_idx] is not None):
+                        offloader = self.text_encoder_offloaders[text_encoder_idx]
+                        offloader.prepare_block_devices_before_forward()
                 self.submodels[id].to('cuda')
         else:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.

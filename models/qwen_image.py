@@ -16,7 +16,7 @@ import transformers
 from PIL import Image, ImageOps
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
-from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors, is_main_process
 from utils.offloading import ModelOffloader
 
 
@@ -280,6 +280,82 @@ class QwenImagePipeline(BasePipeline):
 
     def get_text_encoders(self):
         return [self.text_encoder]
+
+    def enable_text_encoder_block_swap(self, blocks_to_swap):
+        """
+        Enable block swapping for Qwen Image text encoder.
+        Qwen text encoder structure: text_encoder.model.language_model.model.layers
+        """
+        text_encoder = self.text_encoder
+        # Qwen structure: model.language_model.model.layers
+        if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
+            language_model = text_encoder.model.language_model
+            if hasattr(language_model, 'model') and hasattr(language_model.model, 'layers'):
+                layers = language_model.model.layers
+            else:
+                # Fallback: try direct access
+                layers = None
+        else:
+            layers = None
+        
+        if layers is None or len(layers) == 0:
+            raise RuntimeError('Could not find layers in Qwen text encoder for block swapping')
+        
+        num_blocks = len(layers)
+        assert (
+            blocks_to_swap <= num_blocks - 2
+        ), f'Cannot swap more than {num_blocks - 2} text encoder blocks. Requested {blocks_to_swap} blocks to swap.'
+        
+        self.text_encoder_offloaders = []
+        offloader = ModelOffloader(
+            'QwenTextEncoderBlock',
+            list(layers),
+            num_blocks,
+            blocks_to_swap,
+            False,  # supports_backward=False for text encoders (inference only)
+            torch.device('cuda'),
+            False,  # reentrant_activation_checkpointing not used for text encoders
+            debug=False
+        )
+        self.text_encoder_offloaders.append(offloader)
+        
+        # Store reference to layers and offloader for hook registration
+        self._text_encoder_layers = layers
+        self._text_encoder_offloader = offloader
+        self._text_encoder_hooks = []
+        
+        # Register forward hooks on each layer for block swapping
+        for i, layer in enumerate(layers):
+            def make_hook(layer_idx, offloader_ref):
+                def forward_pre_hook(module, input):
+                    # Wait for this block to be on GPU before forward
+                    offloader_ref.wait_for_block(layer_idx)
+                    return None
+                
+                def forward_hook(module, input, output):
+                    # Submit move for this block after forward (move to CPU, next to GPU)
+                    offloader_ref.submit_move_blocks_forward(layer_idx)
+                    return output
+                
+                return forward_pre_hook, forward_hook
+            
+            pre_hook, post_hook = make_hook(i, offloader)
+            # Register pre-hook to wait for current block
+            handle_pre = layer.register_forward_pre_hook(pre_hook)
+            # Register post-hook to submit block move after forward
+            handle_post = layer.register_forward_hook(post_hook)
+            self._text_encoder_hooks.append((handle_pre, handle_post))
+        
+        if is_main_process():
+            print(f'Qwen text encoder block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
+    
+    def _remove_text_encoder_hooks(self):
+        """Remove forward hooks from text encoder layers."""
+        if hasattr(self, '_text_encoder_hooks'):
+            for handle_pre, handle_post in self._text_encoder_hooks:
+                handle_pre.remove()
+                handle_post.remove()
+            self._text_encoder_hooks = []
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)

@@ -172,6 +172,71 @@ class BasePipeline:
 
     def get_text_encoders(self):
         raise NotImplementedError()
+    
+    def enable_text_encoder_block_swap(self, blocks_to_swap):
+        """
+        Enable block swapping for text encoders. Override in model-specific classes.
+        Default implementation tries to find layers in common transformer structures.
+        """
+        text_encoders = self.get_text_encoders()
+        self.text_encoder_offloaders = []
+        
+        for text_encoder in text_encoders:
+            if not isinstance(text_encoder, nn.Module):
+                # Skip ComfyUI wrapped models
+                self.text_encoder_offloaders.append(None)
+                continue
+            
+            # Try to find layers in common transformer structures
+            layers = None
+            if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'layers'):
+                layers = text_encoder.model.layers
+            elif hasattr(text_encoder, 'layers'):
+                layers = text_encoder.layers
+            elif hasattr(text_encoder, 'encoder') and hasattr(text_encoder.encoder, 'layer'):
+                layers = text_encoder.encoder.layer
+            elif hasattr(text_encoder, 'encoder') and hasattr(text_encoder.encoder, 'layers'):
+                layers = text_encoder.encoder.layers
+            
+            if layers is None or len(layers) == 0:
+                # Model doesn't support block swapping or layers not found
+                self.text_encoder_offloaders.append(None)
+                continue
+            
+            num_blocks = len(layers)
+            assert (
+                blocks_to_swap <= num_blocks - 2
+            ), f'Cannot swap more than {num_blocks - 2} text encoder blocks. Requested {blocks_to_swap} blocks to swap.'
+            
+            from utils.offloading import ModelOffloader
+            offloader = ModelOffloader(
+                'TextEncoderBlock',
+                list(layers),
+                num_blocks,
+                blocks_to_swap,
+                False,  # supports_backward=False for text encoders (inference only)
+                torch.device('cuda'),
+                False,  # reentrant_activation_checkpointing not used for text encoders
+                debug=False
+            )
+            self.text_encoder_offloaders.append(offloader)
+        
+        if any(offloader is not None for offloader in self.text_encoder_offloaders):
+            if is_main_process():
+                print(f'Text encoder block swap enabled. Swapping {blocks_to_swap} blocks per text encoder.')
+
+    def prepare_text_encoder_block_swap_for_caching(self):
+        """
+        Prepare text encoder offloaders for caching (forward-only mode).
+        """
+        if not hasattr(self, 'text_encoder_offloaders'):
+            return
+        
+        for offloader in self.text_encoder_offloaders:
+            if offloader is not None:
+                offloader.enable_block_swap()
+                offloader.set_forward_only(True)
+                offloader.prepare_block_devices_before_forward()
 
     def configure_adapter(self, adapter_config):
         target_linear_modules = set()

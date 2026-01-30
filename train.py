@@ -636,6 +636,12 @@ if __name__ == '__main__':
         deepspeed.pipe.PipelineModule.to = to
         model.enable_block_swap(blocks_to_swap)
 
+    # Text encoder block swapping
+    text_encoder_blocks_to_swap = config.get('text_encoder_blocks_to_swap', 0)
+    if text_encoder_blocks_to_swap > 0:
+        model.enable_text_encoder_block_swap(text_encoder_blocks_to_swap)
+        model.prepare_text_encoder_block_swap_for_caching()
+
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}
     activation_checkpointing = config['activation_checkpointing']
