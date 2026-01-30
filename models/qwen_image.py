@@ -842,6 +842,7 @@ class QwenImagePipeline(BasePipeline):
             # Set to None or extract from cached embedding if needed
             pooled_embeds = None
             generator = torch.Generator(device=self.device).manual_seed(seed)
+            prompt_embeds = prompt_embeds.to(self.device, dtype=self.dtype)
             
             with torch.no_grad():                
                 # 2. Prepare Latents (4D: B, C, H, W)
@@ -868,6 +869,7 @@ class QwenImagePipeline(BasePipeline):
                     
                     # Model expects timestep as a tensor
                     t_tensor = (t_curr * 1000).expand(batch).to(self.device, dtype=torch.long)
+                    guidance_tensor = torch.full((batch,), guidance_scale, device=self.device, dtype=self.dtype)
 
                     # Predict
                     model_output = self.transformer(
@@ -875,7 +877,7 @@ class QwenImagePipeline(BasePipeline):
                         encoder_hidden_states=prompt_embeds,
                         timestep=t_tensor,
                         img_shapes=img_shapes,
-                        guidance=torch.full((batch,), guidance_scale, device=self.device, dtype=self.dtype),
+                        guidance=guidance_tensor,
                         return_dict=False
                     )[0]
 
