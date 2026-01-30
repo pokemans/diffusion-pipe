@@ -598,16 +598,18 @@ class ModelOffloader(Offloader):
         # This handles cases where blocks are partially on CUDA (some params on CUDA, some on CPU)
         # We must ensure ALL parameters are on CUDA before forward pass
         # IMPORTANT: We iterate through ALL named_modules() to catch nested submodules like input_layernorm
+        # NOTE: We do NOT call module.to(device) here as it might interfere with parameter movement
+        # Instead, we move parameters manually and update module state explicitly
         params_moved = 0
         params_on_wrong_device = []
         
         # First pass: Move all parameters from ALL modules (including nested submodules)
         # This ensures submodules like input_layernorm within decoder_layer are handled
         for module_name, module in block.named_modules():
-            # Move the module structure itself first
-            module.to(self.device)
+            # Do NOT call module.to(device) here - it might interfere with manual parameter movement
+            # We'll update module state explicitly after moving parameters
             
-            # Then explicitly move all parameters of this module
+            # Explicitly move all parameters of this module
             for param_name, param in module.named_parameters(recurse=False):
                 full_param_name = f"{module_name}.{param_name}" if module_name else param_name
                 # Check device by accessing .data.device to get actual device
@@ -619,9 +621,18 @@ class ModelOffloader(Offloader):
                         # Use blocking move to ensure parameter is on device before forward pass
                         # Directly modify param.data to ensure device change is tracked
                         param.data = param.data.to(self.device, non_blocking=False)
+                        
+                        # CRITICAL: Update module's internal state to ensure attribute access works
+                        # This ensures that module.param_name (e.g., input_layernorm.weight) reflects the new device
+                        if hasattr(module, '_parameters') and param_name in module._parameters:
+                            # Update the _parameters dict to ensure module state is synchronized
+                            module._parameters[param_name] = param
+                        # Also update via setattr to ensure attribute access works correctly
+                        setattr(module, param_name, param)
+                        
                         params_moved += 1
                         
-                        # Verify immediately after move
+                        # Verify immediately after move using param.data.device
                         verify_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
                         if verify_device != self.device.type:
                             params_on_wrong_device.append((full_param_name, verify_device))
@@ -673,6 +684,10 @@ class ModelOffloader(Offloader):
                             for mod_param_name, mod_param in module.named_parameters(recurse=False):
                                 if mod_param_name in param_name or param_name.endswith(mod_param_name):
                                     mod_param.data = mod_param.data.to(self.device, non_blocking=False)
+                                    # Update module state after moving
+                                    if hasattr(module, '_parameters') and mod_param_name in module._parameters:
+                                        module._parameters[mod_param_name] = mod_param
+                                    setattr(module, mod_param_name, mod_param)
                                     if self.debug:
                                         print(f"[{self.block_type}] Retried moving {param_name} through module {module_name}")
                                     found = True
@@ -697,6 +712,13 @@ class ModelOffloader(Offloader):
         if self.debug and buffers_moved > 0:
             print(f"[{self.block_type}] Moved {buffers_moved} buffers for block {block_idx}")
         
+        # CRITICAL: Call block.to(device) AFTER all manual parameter moves to sync PyTorch's internal state
+        # This ensures that module attribute access (e.g., input_layernorm.weight) reflects the correct device
+        # This is essential because PyTorch's internal parameter tracking needs to be synchronized
+        block.to(self.device)
+        if self.debug:
+            print(f"[{self.block_type}] Called block.to({self.device}) to sync PyTorch internal state")
+        
         # Use weights_to_device as double-check (this uses non_blocking, but we've already moved above)
         weights_to_device(block, self.device)
         
@@ -707,19 +729,34 @@ class ModelOffloader(Offloader):
         # This is critical to prevent device mismatch errors
         synchronize_device(self.device)
         
-        # Comprehensive verification - check ALL parameters and buffers
+        # Comprehensive verification - check ALL parameters and buffers using param.data.device
+        # Using param.data.device is more reliable than param.device for verification
         verification_failed = False
         all_params_on_device = True
         all_buffers_on_device = True
         
         for param_name, param in block.named_parameters():
-            if param.device.type != self.device.type:
+            # Use param.data.device for verification as it reflects the actual tensor device
+            actual_param_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
+            if actual_param_device != self.device.type:
                 verification_failed = True
                 all_params_on_device = False
                 if self.debug:
-                    print(f"[{self.block_type}] ERROR: Parameter {param_name} still on {param.device} after wait_for_block!")
-                # Try one more time to move it
+                    print(f"[{self.block_type}] ERROR: Parameter {param_name} still on {actual_param_device} (checked via param.data.device) after wait_for_block!")
+                # Try one more time to move it and update module state
                 param.data = param.data.to(self.device, non_blocking=False)
+                # Update module state
+                parts = param_name.split('.')
+                if len(parts) > 1:
+                    # Try to find the module and update its state
+                    module_path = '.'.join(parts[:-1])
+                    param_attr = parts[-1]
+                    for name, module in block.named_modules():
+                        if name == module_path or name.endswith(module_path):
+                            if hasattr(module, '_parameters') and param_attr in module._parameters:
+                                module._parameters[param_attr] = param
+                            setattr(module, param_attr, param)
+                            break
         
         for buffer_name, buffer in block.named_buffers():
             if buffer is not None and buffer.device.type != self.device.type:
@@ -737,6 +774,24 @@ class ModelOffloader(Offloader):
             print(f"[{self.block_type}] WARNING: Verification failed for block {block_idx}. Some parameters/buffers may still be on wrong device.")
         elif self.debug:
             print(f"[{self.block_type}] Verification passed: All parameters and buffers on {self.device} for block {block_idx}")
+        
+        # Direct access test: Check if input_layernorm.weight is accessible and on correct device
+        # This is a critical test because input_layernorm is a nested submodule that was causing issues
+        if self.debug:
+            try:
+                # Try to find input_layernorm in the block
+                for name, module in block.named_modules():
+                    if 'input_layernorm' in name.lower() or 'layernorm' in name.lower():
+                        if hasattr(module, 'weight'):
+                            weight_device = module.weight.data.device.type if hasattr(module.weight, 'data') else module.weight.device.type
+                            if weight_device != self.device.type:
+                                print(f"[{self.block_type}] WARNING: Direct access test - {name}.weight is on {weight_device}, expected {self.device.type}")
+                            else:
+                                print(f"[{self.block_type}] Direct access test - {name}.weight is correctly on {weight_device}")
+                        break
+            except Exception as e:
+                if self.debug:
+                    print(f"[{self.block_type}] Direct access test failed: {e}")
         
         # Final explicit CUDA synchronization before forward pass
         # This ensures all parameter moves are complete and visible before the forward pass executes
