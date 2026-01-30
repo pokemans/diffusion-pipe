@@ -7,6 +7,7 @@ import os
 import hashlib
 import json
 import tarfile
+import gc
 from inspect import signature
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
@@ -23,7 +24,7 @@ import imageio
 import multiprocess as mp
 from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, empty_cuda_cache
 from utils.cache import Cache
 import comfy.model_management as mm
 
@@ -1181,6 +1182,9 @@ class DatasetManager:
                 for i, submodel in enumerate(self.submodels):
                     if i != id:
                         submodel.to('cpu')
+                # Clear CUDA cache and run garbage collection before moving model to CUDA
+                gc.collect()
+                empty_cuda_cache()
                 self.submodels[id].to('cuda')
         else:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.
