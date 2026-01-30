@@ -44,43 +44,47 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
-
-    # This is not working for all cases (e.g. SD3), so we need to find the corresponding modules
-    # for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
-    #     print(module_to_cpu.__class__, module_to_cuda.__class__)
-    #     if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
-    #         weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+    buffer_move_jobs = []  # For buffers that need to be moved (not swapped)
 
     modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
         if 'lora' in module_to_cuda_name:
             continue
+        # Handle weights
         if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
             module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
             if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
                 weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
             else:
                 if module_to_cuda.weight.data.device.type != device.type:
-                    # print(
-                    #     f"Module {module_to_cuda_name} not found in CPU model or shape mismatch, so not swapping and moving to device"
-                    # )
                     module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+        
+        # Handle buffers (like LayerNorm weights, biases, etc.)
+        # Buffers are moved directly, not swapped
+        for buffer_name in list(module_to_cuda._buffers.keys()):
+            buffer = module_to_cuda._buffers.get(buffer_name)
+            if buffer is not None and buffer.device.type != device.type:
+                buffer_move_jobs.append((module_to_cuda, buffer_name, buffer))
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        # cuda to cpu
+        # cuda to cpu (weights)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.record_stream(stream)
             module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
         stream.synchronize()
 
-        # cpu to cuda
+        # cpu to cuda (weights)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
             module_to_cuda.weight.data = cuda_data_view
+        
+        # Move buffers to device
+        for module_to_cuda, buffer_name, buffer in buffer_move_jobs:
+            module_to_cuda._buffers[buffer_name] = buffer.to(device, non_blocking=True)
 
     stream.synchronize()
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
@@ -112,11 +116,24 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 
 def weights_to_device(layer: nn.Module, device: torch.device):
+    """
+    Move all weights and buffers in a layer to the specified device.
+    This is more thorough than just calling .to() on the module when dealing with
+    blocks that are part of a parent model structure.
+    """
     for name, module in layer.named_modules():
         if device.type == 'cpu' and 'lora' in name:
             continue
+        # Move weights
         if hasattr(module, "weight") and module.weight is not None:
             module.weight.data = module.weight.data.to(device, non_blocking=True)
+        # Move biases
+        if hasattr(module, "bias") and module.bias is not None:
+            module.bias.data = module.bias.data.to(device, non_blocking=True)
+        # Move buffers (like LayerNorm's running_mean, running_var, or weight/bias in some cases)
+        for buffer_name, buffer in module.named_buffers(recurse=False):
+            if buffer is not None:
+                module.register_buffer(buffer_name, buffer.to(device, non_blocking=True))
 
 
 class Offloader:
@@ -283,11 +300,18 @@ class ModelOffloader(Offloader):
         blocks_to_keep_on_cuda = self.blocks[0 : self.num_blocks - self.blocks_to_swap]
         for i, b in enumerate(blocks_to_keep_on_cuda):
             if blocks_on_cpu:
-                # For blocks on CPU, move weights first (doesn't require moving structure)
-                # This is safer and avoids triggering parent model movement
+                # For blocks on CPU, we need to move them carefully to avoid OOM
+                # Explicitly move all parameters and buffers first, then move structure
                 try:
-                    weights_to_device(b, self.device)
-                    # Then move block structure - this should be safe now that weights are on CUDA
+                    # Move all parameters explicitly
+                    for param in b.parameters():
+                        if param.device.type != self.device.type:
+                            param.data = param.data.to(self.device, non_blocking=True)
+                    # Move all buffers explicitly (important for LayerNorm, etc.)
+                    for buffer in b.buffers():
+                        if buffer.device.type != self.device.type:
+                            buffer.data = buffer.data.to(self.device, non_blocking=True)
+                    # Then move the block structure itself (handles any edge cases)
                     b.to(self.device)
                     if self.debug and i % 5 == 0:
                         print(f"[{self.block_type}] Moved block {i} to CUDA")
@@ -296,18 +320,19 @@ class ModelOffloader(Offloader):
                         print(f"[{self.block_type}] OOM while moving block {i}, cleaning cache and retrying")
                     clean_memory_on_device(self.device)
                     gc.collect()
-                    # Try again with just weights
+                    # Try moving weights/buffers first, then structure
                     weights_to_device(b, self.device)
+                    b.to(self.device)
             else:
                 b.to(self.device)
-                weights_to_device(b, self.device)  # make sure weights are on device
+                weights_to_device(b, self.device)  # make sure weights and buffers are on device
 
         # Handle blocks that should be swapped (kept on CPU)
         # These blocks should NOT be moved to CUDA at all
         blocks_to_swap = self.blocks[self.num_blocks - self.blocks_to_swap :]
         for b in blocks_to_swap:
             if blocks_on_cpu:
-                # Blocks are already on CPU, just ensure weights are on CPU
+                # Blocks are already on CPU, ensure all weights are on CPU
                 weights_to_device(b, torch.device('cpu'))
             else:
                 # Blocks are on CUDA, move structure to CPU first, then ensure weights are on CPU
@@ -324,6 +349,17 @@ class ModelOffloader(Offloader):
             # Second forward pass, don't do block swapping
             return
         self._wait_blocks_move(block_idx)
+        # After waiting, ensure the block is fully on device (all params and buffers)
+        # This is important because swap_weight_devices might not move all buffers
+        block = self.blocks[block_idx]
+        # Ensure all parameters are on device
+        for param in block.parameters():
+            if param.device.type != self.device.type:
+                param.data = param.data.to(self.device, non_blocking=True)
+        # Ensure all buffers are on device
+        for buffer in block.buffers():
+            if buffer.device.type != self.device.type:
+                buffer.data = buffer.data.to(self.device, non_blocking=True)
 
     def submit_move_blocks_forward(self, block_idx: int):
         # check if blocks_to_swap is enabled
