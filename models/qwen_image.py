@@ -383,6 +383,32 @@ class QwenImagePipeline(BasePipeline):
                             offloader_ref.wait_for_block(layer_idx)
                             if offloader_ref.debug:
                                 print(f'[HOOK DEBUG] wait_for_block({layer_idx}) completed for layer {layer_idx}')
+                            
+                            # CRITICAL: Force parameter refresh right before forward executes
+                            # Access the exact parameters forward() will use to force PyTorch to refresh
+                            if hasattr(module, 'input_layernorm') and hasattr(module.input_layernorm, 'weight'):
+                                weight = module.input_layernorm.weight
+                                # Force access to both device properties to ensure PyTorch refreshes
+                                _ = weight.device
+                                _ = weight.data.device
+                                # Verify it's actually on CUDA
+                                if weight.data.device.type != 'cuda':
+                                    if offloader_ref.debug:
+                                        print(f'[HOOK DEBUG] WARNING: input_layernorm.weight is on {weight.data.device} after wait_for_block!')
+                                    # Force move one more time
+                                    weight.data = weight.data.to('cuda', non_blocking=False)
+                                    if hasattr(module.input_layernorm, '_parameters') and 'weight' in module.input_layernorm._parameters:
+                                        module.input_layernorm._parameters['weight'] = weight
+                                    setattr(module.input_layernorm, 'weight', weight)
+                                    if offloader_ref.debug:
+                                        print(f'[HOOK DEBUG] Forced input_layernorm.weight to CUDA in hook')
+                            
+                            # Final CUDA synchronization to ensure all moves are complete
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                if offloader_ref.debug:
+                                    print(f'[HOOK DEBUG] Final CUDA synchronization completed in hook')
                         return None
                     
                     def forward_hook(module, input, output):

@@ -916,6 +916,46 @@ class ModelOffloader(Offloader):
                     import traceback
                     traceback.print_exc()
         
+        # CRITICAL: Final aggressive parameter refresh right before returning
+        # Force access to all parameters to ensure PyTorch refreshes its cache
+        # This is the last chance to ensure parameters are on CUDA before forward() executes
+        if self.parent_layers is not None and block_idx < len(self.parent_layers):
+            parent_layer = self.parent_layers[block_idx]
+            if self.debug:
+                print(f"[{self.block_type}] Performing final parameter refresh for block {block_idx}")
+            
+            # Force access to all parameters to ensure PyTorch refreshes its cache
+            for name, param in parent_layer.named_parameters():
+                # Force device property access to refresh PyTorch's internal cache
+                _ = param.device  # Force device property access
+                _ = param.data.device  # Force data device access
+            
+            # Specifically force refresh of input_layernorm.weight - the exact parameter causing issues
+            if hasattr(parent_layer, 'input_layernorm'):
+                input_layernorm = parent_layer.input_layernorm
+                if hasattr(input_layernorm, 'weight'):
+                    weight = input_layernorm.weight
+                    # Force access to device properties
+                    _ = weight.device
+                    _ = weight.data.device
+                    # Double-check and force move if needed
+                    weight_device = weight.data.device.type if hasattr(weight.data, 'device') else weight.device.type
+                    if weight_device != self.device.type:
+                        if self.debug:
+                            print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight is on {weight_device}, forcing move to {self.device.type}")
+                        weight.data = weight.data.to(self.device, non_blocking=False)
+                        # Update all reference paths
+                        if hasattr(input_layernorm, '_parameters') and 'weight' in input_layernorm._parameters:
+                            input_layernorm._parameters['weight'] = weight
+                        if 'weight' in input_layernorm.__dict__:
+                            input_layernorm.__dict__['weight'] = weight
+                        setattr(input_layernorm, 'weight', weight)
+                        if self.debug:
+                            print(f"[{self.block_type}] FINAL CHECK: Forced input_layernorm.weight to {self.device.type}")
+                    else:
+                        if self.debug:
+                            print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight confirmed on {weight_device}")
+        
         # Final explicit CUDA synchronization before forward pass
         # This ensures all parameter moves are complete and visible before the forward pass executes
         if self.device.type == 'cuda':
