@@ -879,19 +879,25 @@ class QwenImagePipeline(BasePipeline):
                     # Use base_dtype for timestep since time_text_embed is kept in high precision
                     t_tensor = (t_curr * 1000).expand(batch).to(transformer_device, dtype=base_dtype)
 
-                    # QwenImageTransformer doesn't support guidance parameter
-                    # The time_text_embed method only accepts timestep and hidden_states
-                    model_output = self.transformer(
-                        hidden_states=latents_seq,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=t_tensor,
-                        img_shapes=img_shapes,
-                        return_dict=False
-                    )[0]
+                    # Ensure hidden_states and encoder_hidden_states are in the correct dtype for the transformer
+                    # If the transformer is quantized (e.g. Float8), it will handle the conversion internally
+                    # but we should ensure we're not passing something that causes a mismatch in the first layer.
+                    # The InitialLayer has @torch.autocast which should handle this, but for generate_samples
+                    # we are calling self.transformer directly which might bypass some of our custom logic.
+                    
+                    with torch.autocast('cuda', dtype=AUTOCAST_DTYPE):
+                        # Ensure inputs are in the expected dtype for autocast if they aren't already
+                        model_output = self.transformer(
+                            hidden_states=latents_seq.to(dtype=AUTOCAST_DTYPE),
+                            encoder_hidden_states=prompt_embeds.to(dtype=AUTOCAST_DTYPE),
+                            timestep=t_tensor.to(dtype=AUTOCAST_DTYPE),
+                            img_shapes=img_shapes,
+                            return_dict=False
+                        )[0]
 
                     # Euler Step
                     dt = t_next - t_curr
-                    latents_seq = latents_seq + model_output * dt
+                    latents_seq = latents_seq + model_output * dt.to(model_output.dtype)
 
                 # --- 5. Reconstruction ---
                 # Sequence back to Spatial
