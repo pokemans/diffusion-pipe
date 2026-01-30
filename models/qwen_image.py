@@ -820,6 +820,11 @@ class QwenImagePipeline(BasePipeline):
         
         self.transformer.eval()
         self.vae.eval()
+        
+        # Get the actual device from the transformer's img_in layer
+        # This ensures we use the correct device even when block swapping is enabled
+        transformer_device = next(self.transformer.img_in.parameters()).device
+        transformer_dtype = next(self.transformer.img_in.parameters()).dtype
 
         for prompt in prompts:
             # --- 1. Handle Cached Embeddings ---
@@ -827,14 +832,14 @@ class QwenImagePipeline(BasePipeline):
                 hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
                 if prompt in self.sample_prompts:
                     cached_idx = self.sample_prompts.index(prompt)
-                    # Force to device immediately upon retrieval
-                    prompt_embeds = self.sample_prompt_embeds[cached_idx].to(self.device, dtype=self.dtype)
+                    # Force to device immediately upon retrieval - use transformer's device
+                    prompt_embeds = self.sample_prompt_embeds[cached_idx].to(transformer_device, dtype=transformer_dtype)
                 else:
                     raise RuntimeError(f'Prompt "{prompt}" not found in cache.')
             else:
                 raise RuntimeError("No cached embeddings found. Call cache_sample_prompts() first.")
 
-            generator = torch.Generator(device=self.device).manual_seed(seed)
+            generator = torch.Generator(device=transformer_device).manual_seed(seed)
             
             with torch.no_grad():                
                 # --- 2. Prepare Latents ---
@@ -842,32 +847,31 @@ class QwenImagePipeline(BasePipeline):
                 latents = torch.randn(
                     (1, in_channels, height // 8, width // 8),
                     generator=generator, 
-                    device=self.device, 
-                    dtype=self.dtype
+                    device=transformer_device, 
+                    dtype=transformer_dtype
                 )
 
                 # --- 3. Prepare Sequence and Shapes ---
                 batch, channels, h, w = latents.shape
-                # Flatten and EXPLICITLY move to device
-                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(self.device, dtype=self.dtype)
+                # Flatten and move to transformer's device
+                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(transformer_device, dtype=transformer_dtype)
                 
                 # RoPE shapes: Qwen2-VL based models usually need (h, w, 1)
                 img_shapes = [(h, w, 1)]
 
                 # --- 4. Flow Matching Loop ---
                 # timesteps 1.0 -> 0.0
-                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=transformer_device, dtype=transformer_dtype)
 
                 for i in tqdm(range(num_inference_steps), desc=f"Generating"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
                     
-                    # Convert t to tensor on device. 
-                    # Note: If output is black/static, try: t_tensor = (t_curr * 1000).expand(batch)...
-                    t_tensor = t_curr.expand(batch).to(self.device, dtype=self.dtype)
+                    # Convert t to tensor on transformer's device
+                    t_tensor = t_curr.expand(batch).to(transformer_device, dtype=transformer_dtype)
                     
-                    # Guidance tensor on device
-                    g_tensor = torch.full((batch,), guidance_val, device=self.device, dtype=self.dtype)
+                    # Guidance tensor on transformer's device
+                    g_tensor = torch.full((batch,), guidance_val, device=transformer_device, dtype=transformer_dtype)
 
                     # --- THE TRANSFORMER CALL ---
                     model_output = self.transformer(
@@ -887,7 +891,10 @@ class QwenImagePipeline(BasePipeline):
                 # Sequence back to Spatial
                 latents = latents_seq.permute(0, 2, 1).view(batch, channels, h, w)
 
-                # VAE Decode
+                # VAE Decode - ensure latents are on VAE's device
+                vae_device = next(self.vae.parameters()).device
+                vae_dtype = next(self.vae.parameters()).dtype
+                latents = latents.to(vae_device, dtype=vae_dtype)
                 latents = latents / self.vae.config.scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
                 
