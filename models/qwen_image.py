@@ -323,6 +323,7 @@ class QwenImagePipeline(BasePipeline):
         self._text_encoder_layers = layers
         self._text_encoder_offloader = offloader
         self._text_encoder_hooks = []
+        self._text_encoder_parent = text_encoder  # Store parent model reference
         
         # Register forward hooks on each layer for block swapping
         for i, layer in enumerate(layers):
@@ -346,8 +347,24 @@ class QwenImagePipeline(BasePipeline):
             handle_post = layer.register_forward_hook(post_hook)
             self._text_encoder_hooks.append((handle_pre, handle_post))
         
-        if is_main_process():
-            print(f'Qwen text encoder block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
+        print(f'Qwen text encoder block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
+    
+    def prepare_text_encoder_block_swap_for_caching(self):
+        """
+        Prepare text encoder block swapping for caching. This ensures the parent model
+        structure is on CUDA before preparing block devices.
+        """
+        if not hasattr(self, 'text_encoder_offloaders') or self.text_encoder_offloaders is None:
+            return
+        
+        for offloader in self.text_encoder_offloaders:
+            if offloader is not None:
+                # Ensure parent model structure is on CUDA first (without moving all weights)
+                # This is handled by prepare_block_devices_before_forward() which moves blocks individually
+                offloader.enable_block_swap()
+                offloader.set_forward_only(True)
+                # Don't call prepare_block_devices_before_forward() here - it will be called
+                # in DatasetManager when the text encoder is actually needed
     
     def _remove_text_encoder_hooks(self):
         """Remove forward hooks from text encoder layers."""

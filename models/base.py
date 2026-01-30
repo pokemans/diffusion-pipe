@@ -222,8 +222,7 @@ class BasePipeline:
             self.text_encoder_offloaders.append(offloader)
         
         if any(offloader is not None for offloader in self.text_encoder_offloaders):
-            if is_main_process():
-                print(f'Text encoder block swap enabled. Swapping {blocks_to_swap} blocks per text encoder.')
+            print(f'Text encoder block swap enabled. Swapping {blocks_to_swap} blocks per text encoder.')
 
     def prepare_text_encoder_block_swap_for_caching(self):
         """

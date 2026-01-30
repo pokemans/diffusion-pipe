@@ -1199,14 +1199,21 @@ class DatasetManager:
                 # Clear CUDA cache and run garbage collection before moving model to CUDA
                 gc.collect()
                 empty_cuda_cache()
-                # If this is a text encoder and block swapping is enabled, prepare block devices
+                # If this is a text encoder and block swapping is enabled, handle it specially
                 if id > 0 and self.text_encoder_offloaders is not None:
                     text_encoder_idx = id - 1
                     if (text_encoder_idx < len(self.text_encoder_offloaders) and 
                         self.text_encoder_offloaders[text_encoder_idx] is not None):
                         offloader = self.text_encoder_offloaders[text_encoder_idx]
+                        # For block swapping, prepare_block_devices_before_forward() moves blocks individually
+                        # to CUDA, then moves weights of swapped blocks back to CPU. This avoids OOM from
+                        # moving the entire model at once. The blocks are moved individually, so the parent
+                        # model structure doesn't need to be fully on CUDA first.
                         offloader.prepare_block_devices_before_forward()
-                self.submodels[id].to('cuda')
+                    else:
+                        self.submodels[id].to('cuda')
+                else:
+                    self.submodels[id].to('cuda')
         else:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.
             self.submodels[id].load_model_if_needed()
