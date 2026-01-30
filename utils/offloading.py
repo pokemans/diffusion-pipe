@@ -394,6 +394,7 @@ class ModelOffloader(Offloader):
 
         # Handle blocks that should be swapped (kept on CPU)
         # These blocks should NOT be moved to CUDA at all
+        # They will be swapped to CUDA during forward pass when needed
         blocks_to_swap = self.blocks[self.num_blocks - self.blocks_to_swap :]
         for i, b in enumerate(blocks_to_swap):
             block_idx = self.num_blocks - self.blocks_to_swap + i
@@ -406,6 +407,19 @@ class ModelOffloader(Offloader):
                 b.to(torch.device('cpu'))
                 weights_to_device(b, torch.device('cpu'))
                 verify_module_on_device(b, torch.device('cpu'), f"block_{block_idx}")
+            
+            # Verify block is actually on CPU after setup
+            if self.debug:
+                try:
+                    first_param = next(b.parameters(), None)
+                    if first_param is not None:
+                        actual_device = first_param.device.type
+                        if actual_device != 'cpu':
+                            print(f"[{self.block_type}] WARNING: Block {block_idx} should be on CPU but is on {actual_device}")
+                        else:
+                            print(f"[{self.block_type}] Verified block {block_idx} is on CPU")
+                except StopIteration:
+                    pass
 
         # Synchronize to ensure all device moves are complete before any forward passes
         synchronize_device(self.device)
@@ -434,11 +448,61 @@ class ModelOffloader(Offloader):
         if self.debug:
             print(f"[{self.block_type}] wait_for_block called for block {block_idx}")
         
-        self._wait_blocks_move(block_idx)
-        # After waiting, ensure the block is fully on device (all params and buffers)
-        # This is important because swap_weight_devices might not move all buffers
         block = self.blocks[block_idx]
         
+        # Check if block is currently on CPU
+        # Get device of first parameter to determine block's current device
+        block_device = None
+        try:
+            first_param = next(block.parameters(), None)
+            if first_param is not None:
+                block_device = first_param.device.type
+        except StopIteration:
+            pass
+        
+        # Determine if block should be on CUDA
+        # Blocks [0 : num_blocks - blocks_to_swap] should be on CUDA initially
+        # Blocks [num_blocks - blocks_to_swap :] start on CPU and are swapped to CUDA when needed
+        # All blocks should be on CUDA when accessed during forward pass
+        should_be_on_cuda = True
+        
+        # If block is on CPU and should be on CUDA, we need to swap it
+        if block_device == 'cpu' and should_be_on_cuda:
+            if self.debug:
+                print(f"[{self.block_type}] Block {block_idx} is on CPU, needs swap to CUDA")
+            
+            # Calculate which block to swap out
+            # Initial state: blocks [0 : num_blocks - blocks_to_swap] on CUDA, blocks [num_blocks - blocks_to_swap :] on CPU
+            # When accessing block N (where N >= num_blocks - blocks_to_swap):
+            # - Swap block (N - (num_blocks - blocks_to_swap)) to CPU
+            #   Actually: we want to swap the block that's currently at position (N - blocks_to_swap) in the CUDA range
+            # - Swap block N to CUDA
+            # The logic: if we're accessing block N from the CPU range, we swap block (N - blocks_to_swap) to CPU
+            # But we need to be careful: blocks [0 : num_blocks - blocks_to_swap] are on CUDA
+            # So block_idx_to_cpu should be in range [0 : num_blocks - blocks_to_swap)
+            if block_idx >= (self.num_blocks - self.blocks_to_swap):
+                # Block is in the CPU range, calculate which CUDA block to swap out
+                # The block at position (block_idx - (num_blocks - blocks_to_swap)) in the CUDA range
+                # Actually, simpler: swap block (block_idx - blocks_to_swap) to CPU, swap block_idx to CUDA
+                block_idx_to_cpu = block_idx - self.blocks_to_swap
+                block_idx_to_cuda = block_idx
+                
+                # Ensure block_idx_to_cpu is valid (should be in [0 : num_blocks - blocks_to_swap))
+                if 0 <= block_idx_to_cpu < (self.num_blocks - self.blocks_to_swap):
+                    if self.debug:
+                        print(f"[{self.block_type}] Submitting swap: block {block_idx_to_cpu} -> CPU, block {block_idx_to_cuda} -> CUDA")
+                    
+                    # Submit the swap
+                    self._submit_move_blocks(block_idx_to_cpu, block_idx_to_cuda)
+                else:
+                    if self.debug:
+                        print(f"[{self.block_type}] WARNING: Invalid swap indices: block_idx_to_cpu={block_idx_to_cpu}, block_idx_to_cuda={block_idx_to_cuda}")
+        
+        # Wait for swap to complete (if one was submitted)
+        self._wait_blocks_move(block_idx)
+        
+        # After waiting, ensure the block is fully on device (all params and buffers)
+        # This is important because swap_weight_devices might not move all buffers
         # First, use .to() on the block to move the structure - this handles most cases
         # But .to() might not work correctly for blocks that are part of a parent model,
         # so we also explicitly move all parameters and buffers below

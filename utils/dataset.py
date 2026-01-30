@@ -1225,16 +1225,12 @@ class DatasetManager:
                             self.text_encoder_offloaders[text_encoder_idx] is not None):
                             offloader = self.text_encoder_offloaders[text_encoder_idx]
                             print(f'[DEBUG] _handle_task: Using block swapping for text encoder {text_encoder_idx}')
-                            # Move parent text encoder model structure to CUDA to establish device context
-                            # This ensures the model's device property returns the correct device
-                            # We don't move all weights here - blocks will be moved individually by prepare_block_devices_before_forward()
-                            text_encoder_model = self.submodels[id]
-                            print(f'[DEBUG] _handle_task: Moving parent text encoder structure to CUDA')
-                            text_encoder_model.to('cuda')
-                            # For block swapping, prepare_block_devices_before_forward() moves blocks individually
-                            # to CUDA, then moves weights of swapped blocks back to CPU. This avoids OOM from
-                            # moving the entire model at once. The improved implementation ensures all
-                            # submodules and buffers are properly moved to the correct device.
+                            # For block swapping, prepare_block_devices_before_forward() sets up the initial state:
+                            # - Blocks [0 : num_blocks - blocks_to_swap] are moved to CUDA
+                            # - Blocks [num_blocks - blocks_to_swap :] are kept on CPU
+                            # During forward pass, blocks are swapped between CPU and CUDA as needed.
+                            # We do NOT move the parent model structure to CUDA as that would move ALL blocks,
+                            # breaking the block swapping mechanism.
                             offloader.prepare_block_devices_before_forward()
                         else:
                             print(f'[DEBUG] _handle_task: Block swapping not available for text encoder {text_encoder_idx}, moving entire model to CUDA')
