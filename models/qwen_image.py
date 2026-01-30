@@ -916,12 +916,13 @@ class QwenImagePipeline(BasePipeline):
             # Apply VAE normalization reversal
             final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
             
-            # Qwen VAE expects (bs, c, h, w) format for single images, not (bs, c, f, h, w)
-            # Squeeze frame dimension if num_frames == 1
-            if final_latents.ndim == 5 and final_latents.shape[2] == 1:
-                final_latents = final_latents.squeeze(2)  # (bs, c, 1, h, w) -> (bs, c, h, w)
+            # Qwen VAE expects (bs, c, num_frames, h, w) format - keep frame dimension even if it's 1
+            # Ensure final_latents is 5D: (bs, c, num_frames, h, w)
+            if final_latents.ndim == 4:
+                # If somehow we got 4D, add frame dimension
+                final_latents = final_latents.unsqueeze(2)  # (bs, c, h, w) -> (bs, c, 1, h, w)
             
-            # Decode
+            # Decode - VAE expects 5D tensor
             decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
             if hasattr(decoded, 'sample'):
                 decoded = decoded.sample
@@ -942,13 +943,12 @@ class QwenImagePipeline(BasePipeline):
                     pass  # Ignore errors during cleanup
         
         # Handle frame dimension in decoded tensor before indexing
-        # VAE output format: [B, C, H, W] for images (frame dimension already squeezed before decode)
-        # But check for 5D output just in case
+        # VAE decode returns 5D tensor [B, C, num_frames, H, W], squeeze frame dimension for single images
         if decoded.ndim == 5:
             if decoded.shape[2] == 1:
                 decoded = decoded.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
             else:
-                raise ValueError(f"Unexpected decoded tensor shape: {decoded.shape}, expected 4D [B, C, H, W] or 5D [B, C, 1, H, W]")
+                raise ValueError(f"Unexpected decoded tensor shape: {decoded.shape}, expected 5D [B, C, 1, H, W] for single images")
         
         # Validate decoded tensor shape
         if decoded.ndim != 4:
