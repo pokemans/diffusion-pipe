@@ -65,6 +65,9 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             buffer = module_to_cuda._buffers.get(buffer_name)
             if buffer is not None and buffer.device.type != device.type:
                 buffer_move_jobs.append((module_to_cuda, buffer_name, buffer))
+    
+    # Note: swap_weight_devices_cuda only handles weight swapping for efficiency
+    # All other parameters are moved by wait_for_block() which is called before forward pass
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
@@ -418,14 +421,41 @@ class ModelOffloader(Offloader):
         # This is important because swap_weight_devices might not move all buffers
         block = self.blocks[block_idx]
         
+        # First, use .to() on the block to move the structure - this handles most cases
+        # But .to() might not work correctly for blocks that are part of a parent model,
+        # so we also explicitly move all parameters and buffers below
+        block.to(self.device)
+        
         # Explicitly move ALL parameters to ensure nothing is missed
         # This is critical for nested submodules like input_layernorm.weight
+        # Use blocking moves here since we're right before forward pass - need to ensure completion
         for param_name, param in block.named_parameters():
             if param.device.type != self.device.type:
                 if 'lora' not in param_name:  # Skip LoRA params when moving to CPU
-                    param.data = param.data.to(self.device, non_blocking=True)
+                    # Use blocking move to ensure parameter is on device before forward pass
+                    # Direct assignment to .data should update the parameter's device tracking
+                    param.data = param.data.to(self.device, non_blocking=False)
+                    # Double-check the parameter is now on device
+                    if param.device.type != self.device.type:
+                        # If still not on device, try accessing the parameter through its module
+                        for name, module in block.named_modules():
+                            if param_name in dict(module.named_parameters(recurse=False)):
+                                # Get the parameter from the module and move it
+                                module_param = dict(module.named_parameters(recurse=False))[param_name]
+                                module_param.data = module_param.data.to(self.device, non_blocking=False)
+                                break
         
-        # Use weights_to_device to ensure all components are moved (double-check)
+        # Move all buffers explicitly with blocking moves
+        for buffer_name, buffer in block.named_buffers():
+            if buffer is not None and buffer.device.type != self.device.type:
+                # Find the module that owns this buffer and update it
+                for name, module in block.named_modules():
+                    if buffer_name in dict(module.named_buffers(recurse=False)):
+                        # Use blocking move for buffers too
+                        module.register_buffer(buffer_name, buffer.to(self.device, non_blocking=False))
+                        break
+        
+        # Use weights_to_device as double-check (this uses non_blocking, but we've already moved above)
         weights_to_device(block, self.device)
         
         # Verify all components are on device (this will move any remaining components)
