@@ -839,10 +839,27 @@ class QwenImagePipeline(BasePipeline):
             generator = torch.Generator(device=self.device).manual_seed(seed)
             
             with torch.no_grad():
-                # 2. Encode Text Prompt
-                # Assuming self._encode_prompt handles the Qwen2.5-VL encoding logic
-                # Returns: prompt_embeds (hidden states), pooled_embeds (pooled vector)
-                prompt_embeds, pooled_embeds = self._encode_prompt(prompt)
+                # 2. Retrieve cached prompt embeddings or encode if not cached
+                # Check if cached embeddings exist and match this prompt
+                use_cached = False
+                if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
+                    hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
+                    # Check if current prompt matches a cached prompt
+                    if prompt in self.sample_prompts:
+                        cached_idx = self.sample_prompts.index(prompt)
+                        cached_embed = self.sample_prompt_embeds[cached_idx]
+                        # Use cached embedding, moving to correct device and dtype
+                        prompt_embeds = cached_embed.to(self.device, self.dtype)
+                        use_cached = True
+                
+                if not use_cached:
+                    # Fallback: encode prompt if not cached
+                    # Note: This should not happen if cache_sample_prompts was called properly
+                    raise RuntimeError(f'Prompt "{prompt}" not found in cached embeddings. Call cache_sample_prompts() before generate_samples().')
+                
+                # Qwen Image doesn't use pooled embeddings in the same way as SDXL
+                # Set to None or extract from cached embedding if needed
+                pooled_embeds = None
 
                 # 3. Prepare Latents (Noise)
                 # Qwen-Image typically uses 16 channels (similar to Flux/SD3) and 8x compression
