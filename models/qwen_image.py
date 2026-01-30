@@ -352,19 +352,19 @@ class QwenImagePipeline(BasePipeline):
         try:
             for i, layer in enumerate(layers):
                 def make_hook(layer_idx, offloader_ref):
-                def forward_pre_hook(module, input):
-                    # Only do block swapping if it's enabled (during caching)
-                    # During training, block swapping should be disabled
-                    if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
-                        offloader_ref.wait_for_block(layer_idx)
-                    return None
-                
-                def forward_hook(module, input, output):
-                    # Only do block swapping if it's enabled (during caching)
-                    # During training, block swapping should be disabled
-                    if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
-                        offloader_ref.submit_move_blocks_forward(layer_idx)
-                    return output
+                    def forward_pre_hook(module, input):
+                        # Only do block swapping if it's enabled (during caching)
+                        # During training, block swapping should be disabled
+                        if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
+                            offloader_ref.wait_for_block(layer_idx)
+                        return None
+                    
+                    def forward_hook(module, input, output):
+                        # Only do block swapping if it's enabled (during caching)
+                        # During training, block swapping should be disabled
+                        if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
+                            offloader_ref.submit_move_blocks_forward(layer_idx)
+                        return output
                     
                     return forward_pre_hook, forward_hook
                 
