@@ -815,84 +815,78 @@ class QwenImagePipeline(BasePipeline):
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         images = []
         
+        # Default guidance if None (Qwen usually likes 1.0 or 3.5 depending on the setup)
+        if guidance_scale is None:
+            guidance_scale = 1.0
+            
         self.transformer.eval()
         self.vae.eval()
 
-        # Qwen-Image typically uses a patch size of 2 for its transformer
-        patch_size = 2 
-        
         for prompt in prompts:
+            # --- Cached Embedding Logic ---
             use_cached = False
             if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
                 hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
-                # Check if current prompt matches a cached prompt
                 if prompt in self.sample_prompts:
                     cached_idx = self.sample_prompts.index(prompt)
-                    cached_embed = self.sample_prompt_embeds[cached_idx]
-                    # Use cached embedding, moving to correct device and dtype
-                    prompt_embeds = cached_embed.to(self.device, self.dtype)
+                    prompt_embeds = self.sample_prompt_embeds[cached_idx].to(self.device, dtype=self.dtype)
                     use_cached = True
                 
             if not use_cached:
-                # Fallback: encode prompt if not cached
-                # Note: This should not happen if cache_sample_prompts was called properly
-                raise RuntimeError(f'Prompt "{prompt}" not found in cached embeddings. Call cache_sample_prompts() before generate_samples().')
-                
-            # Qwen Image doesn't use pooled embeddings in the same way as SDXL
-            # Set to None or extract from cached embedding if needed
-            pooled_embeds = None
+                raise RuntimeError(f'Prompt "{prompt}" not found in cached embeddings.')
+
             generator = torch.Generator(device=self.device).manual_seed(seed)
-            prompt_embeds = prompt_embeds.to(self.device, dtype=self.dtype)
             
             with torch.no_grad():                
-                # 2. Prepare Latents (4D: B, C, H, W)
+                # 1. Prepare Latents (Ensure device/dtype at creation)
                 in_channels = self.transformer.config.in_channels
                 latents = torch.randn(
                     (1, in_channels, height // 8, width // 8),
-                    generator=generator, device=self.device, dtype=self.dtype
+                    generator=generator, 
+                    device=self.device, 
+                    dtype=self.dtype
                 )
 
-                # 3. Flatten latents for the Transformer
-                # Shape: [1, channels, h, w] -> [1, h*w, channels]
+                # 2. Flatten and Force Device
                 batch, channels, h, w = latents.shape
-                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1)
+                # We explicitly call .to(self.device) here to resolve the RuntimeError
+                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(self.device, dtype=self.dtype)
                 
-                # Prepare img_shapes for RoPE: [(h, w, 1)]
                 img_shapes = [(h, w, 1)]
 
-                # 4. Flow Matching Loop
+                # 3. Sampling Loop
                 timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
 
-                for i in tqdm(range(num_inference_steps), desc="Sampling"):
+                for i in tqdm(range(num_inference_steps), desc=f"Sampling {prompt[:15]}..."):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
                     
-                    # Model expects timestep as a tensor
+                    # Convert t to the range/dtype the model expects (usually 0-1000 for Long)
                     t_tensor = (t_curr * 1000).expand(batch).to(self.device, dtype=torch.long)
-                    guidance_tensor = torch.full((batch,), guidance_scale, device=self.device, dtype=self.dtype)
+                    
+                    # Ensure guidance tensor is on device
+                    g_tensor = torch.full((batch,), guidance_scale, device=self.device, dtype=self.dtype)
 
-                    # Predict
                     model_output = self.transformer(
                         hidden_states=latents_seq,
                         encoder_hidden_states=prompt_embeds,
                         timestep=t_tensor,
                         img_shapes=img_shapes,
-                        guidance=guidance_tensor,
+                        guidance=g_tensor,
                         return_dict=False
                     )[0]
 
-                    # Euler Step on the sequence
+                    # Euler Step
                     dt = t_next - t_curr
                     latents_seq = latents_seq + model_output * dt
 
-                # 5. Unflatten Latents back to 4D for VAE
+                # 4. Reshape back for VAE
                 latents = latents_seq.permute(0, 2, 1).view(batch, channels, h, w)
 
-                # 6. Decode
+                # 5. Decode and Post-Process
                 latents = latents / self.vae.config.scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
                 
-                # 7. Post-process
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).float().numpy()
                 pil_image = Image.fromarray((image[0] * 255).astype("uint8"))
