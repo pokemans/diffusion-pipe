@@ -786,13 +786,12 @@ class QwenImagePipeline(BasePipeline):
             height: Image height in pixels
             width: Image width in pixels
             seed: Random seed for reproducibility
-            guidance_scale: Not used for Qwen Image (no CFG)
+            guidance_scale: Guidance scale (not used for Qwen Image, kept for API compatibility)
             
         Returns:
             List of PIL Images
         """
         import torchvision
-        from PIL import Image
         import numpy as np
         
         # Set random seed
@@ -801,200 +800,157 @@ class QwenImagePipeline(BasePipeline):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         
+        # Get device and dtype
         device = next(self.transformer.parameters()).device
         dtype = self.model_config['dtype']
         
-        # Check if we have cached embeddings
-        if self.sample_prompt_embeds is None or self.sample_prompts != prompts:
-            raise RuntimeError('Sample prompt embeddings must be cached before calling generate_samples. Call cache_sample_prompts() during dataset caching.')
+        # Round height/width to multiple of pixels_round_to_multiple (32)
+        height = ((height + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
+        width = ((width + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
         
-        prompt_embeds = self.sample_prompt_embeds
+        # Calculate latent dimensions (packing reduces spatial dims by 2)
+        latent_h = height // 2
+        latent_w = width // 2
         
-        # Format prompt embeds similar to prepare_inputs()
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.bool, device=device) for e in prompt_embeds]
-        max_seq_len = max([e.size(0) for e in prompt_embeds])
-        prompt_embeds_tensor = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in prompt_embeds]
+        # Get num_channels_latents from transformer config
+        num_channels_latents = self.transformer.config.in_channels // 4
+        
+        # Ensure transformer is loaded
+        if not hasattr(self, 'transformer') or self.transformer is None:
+            self.load_diffusion_model()
+        
+        # Prepare for inference
+        self.transformer.eval()
+        self.prepare_block_swap_inference(disable_block_swap=False)
+        
+        # Encode prompts
+        prompt_embeds_list = self._get_qwen_prompt_embeds(
+            prompts,
+            control_files=None,
+            device=device
+        )
+        
+        # Pad prompt embeds to same length (same as prepare_inputs does)
+        attn_mask_list = [torch.ones(e.size(0), dtype=torch.bool, device=device) for e in prompt_embeds_list]
+        max_seq_len = max([e.size(0) for e in prompt_embeds_list])
+        prompt_embeds = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in prompt_embeds_list]
         ).to(device, dtype)
         prompt_embeds_mask = torch.stack(
             [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
         ).to(device)
         
         max_text_len = prompt_embeds_mask.sum(dim=1).max().item()
-        prompt_embeds_tensor = prompt_embeds_tensor[:, :max_text_len, :]
+        prompt_embeds = prompt_embeds[:, :max_text_len, :]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_text_len]
         
-        # Round height/width to multiple of pixels_round_to_multiple (32 for Qwen Image)
-        height = ((height + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
-        width = ((width + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
-        
-        # Calculate latent dimensions
-        # Qwen Image VAE uses 8x downsampling (standard VAE downsampling)
-        latent_h = height // 8
-        latent_w = width // 8
-        num_channels_latents = self.transformer.config.in_channels // 4
-        num_frames = 1  # Single image, not video
-        
+        # Initialize latents with random noise (unpacked format: bs, c, f, h, w)
         bs = len(prompts)
+        num_frames = 1  # For images
+        # Start with noise x_0 (at t=1, we have pure noise)
+        x_0 = torch.randn(bs, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
+        # Current state x_t starts as x_0
+        x_t = x_0.clone()
         
-        # Initialize latents with random noise
-        latents = torch.randn(bs, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
-        
-        # Flow matching sampling: Euler steps from t=1 to t=0
+        # Flow matching sampling: Euler steps from t=1.0 to t=0.0
         dt = 1.0 / num_inference_steps
         timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
         
-        self.transformer.eval()
-        layers = self.to_layers()
-        
         with torch.no_grad():
-            # Start with pure noise at t=1
-            x_0 = torch.randn_like(latents)  # Noise
-            x_1 = torch.randn_like(latents)  # Will be updated to clean latents
-            
             for i in range(num_inference_steps):
                 t = timesteps[i]
                 
-                # Create x_t = (1 - t) * x_1 + t * x_0 (interpolation between clean and noise)
-                t_expanded = t.view(-1, 1, 1, 1, 1)
-                x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
-                
-                # Pack latents for transformer
+                # Pack current state for model input: (bs, c, f, h, w) -> (bs, seq_len, hidden_dim)
                 x_t_packed = self._pack_latents(x_t, bs, num_channels_latents, latent_h, latent_w)
                 
-                # Prepare inputs for model (same format as prepare_inputs)
-                img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device).repeat((bs, 1, 1))
-                txt_seq_lens = torch.tensor([max_text_len], dtype=torch.int32, device=device).repeat((bs,))
+                # The model is trained to predict target = x_0 - x_1 given x_t
+                # We use x_t directly and let the model predict the velocity field
+                # Prepare attention mask
                 img_attention_mask = torch.ones((bs, x_t_packed.shape[1]), dtype=torch.bool, device=device)
                 attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
                 attention_mask = attention_mask.view(bs, 1, 1, -1)
                 
-                t_tensor = t.expand(bs).to(device, dtype)
+                # Prepare img_shapes and txt_seq_lens
+                img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device).repeat((bs, 1, 1))
+                txt_seq_lens = torch.tensor([max_text_len], dtype=torch.int32, device=device).repeat((bs,))
                 
-                # Forward through model layers
-                model_inputs = (x_t_packed, prompt_embeds_tensor, attention_mask, t_tensor, img_shapes, txt_seq_lens)
+                # Transform t according to model config (same as prepare_inputs)
+                t_for_model = t.expand(bs).to(dtype)
+                timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+                
+                # Note: prepare_inputs applies sigmoid to sampled values, but we already have t in [0,1]
+                # So we skip the sigmoid step since t is already in the correct range
+                # But we still apply shift if configured
+                if shift := self.model_config.get('shift', None):
+                    t_for_model = (t_for_model * shift) / (1 + (shift - 1) * t_for_model)
+                elif self.model_config.get('flux_shift', False):
+                    mu = get_lin_function(y1=0.5, y2=1.15)((latent_h // 2) * (latent_w // 2))
+                    t_for_model = time_shift(mu, 1.0, t_for_model)
+                
+                # Forward through layers
+                model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
+                layers = self.to_layers()
                 x = model_inputs
                 for layer in layers:
                     x = layer(x)
                 
-                # x is the predicted target (x_0 - x_1)
-                predicted_target = x
+                # x is the predicted target = x_0 - x_1 (packed format)
+                predicted_target_packed = x
                 
-                # Unpack predicted target
-                predicted_target_unpacked = self._unpack_latents(predicted_target, bs, num_channels_latents, latent_h, latent_w)
+                # Unpack predicted target: (bs, seq_len, hidden_dim) -> (bs, c, f, h, w)
+                predicted_target = self._unpack_latents(predicted_target_packed, bs, num_channels_latents, latent_h, latent_w)
                 
-                # Euler step: move towards clean latents
-                # predicted_target = x_0 - x_1, so to move towards x_1:
-                # x_1_new = x_t - dt * predicted_target
-                # This is equivalent to: x_1_new = x_t - dt * (x_0 - x_1_old)
-                x_1 = x_t - dt * predicted_target_unpacked
-                
-                # For next iteration, update x_0 to current x_1 using in-place copy to avoid memory leak
-                x_0.copy_(x_1)
-                
-                # Explicitly delete intermediate tensors to free memory
-                del x_t, x_t_packed, predicted_target, predicted_target_unpacked, attention_mask, img_attention_mask, img_shapes, txt_seq_lens, t_tensor, model_inputs, x
+                # Flow matching ODE: dx/dt = v_t(x) where v_t(x_t) = x_0 - x_1
+                # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
+                # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
+                x_t = x_t - dt * predicted_target
         
-        # Final latents are x_1 (clean latents) - already in spatial format (bs, c, f, h, w)
-        final_latents = x_1
+        # After sampling, x_t should be close to x_1 (clean latents)
+        latents = x_t
         
-        # Decode with VAE
-        # Keep VAE on CPU to avoid GPU memory pressure when restoring block swap training state
-        # This is slower (~1-5s vs ~50-200ms) but acceptable since sample generation is infrequent
+        # Decode latents with VAE
         vae = self.get_vae()
+        vae.eval()
+        vae.to(device)
         
-        # Ensure VAE is on CPU (it should already be, but be explicit)
-        vae_device = next(vae.parameters()).device
-        if vae_device.type == 'cuda':
-            vae.to('cpu')
+        # Reverse normalization: latents = latents * std + mean
+        # Latents are in unpacked format: (bs, c, f, h, w)
+        # VAE expects (bs, c, h, w) for images, so remove frame dimension
+        latents_for_vae = latents.squeeze(2)  # Remove frame dimension: (bs, c, h, w)
         
-        # Move latents to CPU first to avoid device mismatch with VAE normalization buffers
-        # VAE buffers (latents_std_tensor, latents_mean_tensor) are on CPU, so final_latents must be too
-        final_latents_cpu = final_latents.cpu()
-        del final_latents  # Free GPU memory immediately
+        # Reverse normalization: latents_mean_tensor and latents_std_tensor have shape (1, z_dim, 1, 1, 1)
+        # Squeeze frame dimension to get (1, z_dim, 1, 1) which broadcasts with (bs, c, h, w)
+        mean_tensor = self.vae.latents_mean_tensor.squeeze(2)  # (1, z_dim, 1, 1)
+        std_tensor = self.vae.latents_std_tensor.squeeze(2)  # (1, z_dim, 1, 1)
+        latents_for_vae = latents_for_vae * std_tensor + mean_tensor
         
-        # Qwen VAE expects (bs, c, num_frames, h, w) format - keep frame dimension even if it's 1
-        # Ensure final_latents_cpu is 5D: (bs, c, num_frames, h, w)
-        if final_latents_cpu.ndim == 4:
-            # If somehow we got 4D, add frame dimension
-            final_latents_cpu = final_latents_cpu.unsqueeze(2)  # (bs, c, h, w) -> (bs, c, 1, h, w)
-        
-        # Apply VAE normalization reversal (all tensors on CPU now)
-        final_latents_cpu = final_latents_cpu * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
-        
-        # Decode on CPU - VAE expects 5D tensor
-        decoded = vae.decode(final_latents_cpu.to(vae.dtype))
-        if hasattr(decoded, 'sample'):
-            decoded = decoded.sample
-        elif isinstance(decoded, dict):
-            decoded = decoded['sample']
-        
-        # Decoded is already on CPU, ensure float32
-        decoded = decoded.float()
-        
-        # Clean up CPU latents after decode
-        del final_latents_cpu
-        
-        # Handle frame dimension in decoded tensor before indexing
-        # VAE decode returns 5D tensor [B, C, num_frames, H, W], squeeze frame dimension for single images
-        if decoded.ndim == 5:
-            if decoded.shape[2] == 1:
-                decoded = decoded.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
-            else:
-                raise ValueError(f"Unexpected decoded tensor shape: {decoded.shape}, expected 5D [B, C, 1, H, W] for single images")
-        
-        # Validate decoded tensor shape
-        if decoded.ndim != 4:
-            raise ValueError(f"Decoded tensor must be 4D [B, C, H, W], got shape: {decoded.shape}")
-        if decoded.shape[1] != 3:
-            raise ValueError(f"Decoded tensor must have 3 channels (RGB), got {decoded.shape[1]} channels")
-        
-        # Convert to PIL images
-        images = []
-        for i in range(len(prompts)):
-            img = decoded[i]  # Shape: [C, H, W]
+        # Decode with VAE - diffusers VAE expects (B, C, H, W)
+        with torch.no_grad():
+            decoded = self.vae.decode(latents_for_vae.to(vae.device, vae.dtype))
             
-            # Ensure tensor is float32 and on CPU
-            if not img.is_floating_point():
-                img = img.float()
-            if img.device != torch.device('cpu'):
-                img = img.cpu()
+            # Handle VAE output
+            if hasattr(decoded, 'sample'):
+                decoded = decoded.sample
+            elif isinstance(decoded, dict):
+                decoded = decoded['sample']
             
-            # VAE output is in range [-1, 1], convert to [0, 1]
-            img = (img + 1) / 2
-            img = img.clamp(0, 1)
+            # Ensure format is (B, C, H, W)
+            if decoded.dim() == 4 and decoded.shape[-1] == 3:
+                decoded = decoded.movedim(-1, 1)
             
-            # Ensure we have 3D tensor [C, H, W] for PIL conversion
-            if img.ndim != 3:
-                # If still not 3D, try squeezing size-1 dims
-                img = img.squeeze()
-                if img.ndim != 3:
-                    raise ValueError(f"Image tensor must be 3D [C, H, W] after processing, got shape: {img.shape}")
-            
-            # Validate tensor values are in valid range for PIL
-            if img.min() < 0 or img.max() > 1:
+            # Convert to PIL images
+            images = []
+            for i in range(len(prompts)):
+                img = decoded[i].cpu().float()
+                # VAE output is typically in range [-1, 1], convert to [0, 1]
+                img = (img + 1) / 2
                 img = img.clamp(0, 1)
-            
-            # Convert to PIL
-            pil_img = torchvision.transforms.functional.to_pil_image(img)
-            images.append(pil_img)
-        
-        # Explicitly delete large tensors to free GPU memory before returning
-        # Note: final_latents was already deleted earlier (moved to CPU as final_latents_cpu, then deleted)
-        del decoded, latents, x_0, x_1, prompt_embeds_tensor, prompt_embeds_mask
-        if 'attn_mask_list' in locals():
-            del attn_mask_list
-        if 'timesteps' in locals():
-            del timesteps
-        
-        # Force garbage collection and clear CUDA cache
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                # Convert to PIL
+                pil_img = torchvision.transforms.functional.to_pil_image(img)
+                images.append(pil_img)
         
         return images
-
+        
     def to_layers(self):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
