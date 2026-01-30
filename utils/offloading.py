@@ -256,7 +256,17 @@ class ModelOffloader(Offloader):
 
     def prepare_block_devices_before_forward(self):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            # Check if blocks are already on target device before moving to avoid unnecessary memory allocation
             for block in self.blocks:
+                try:
+                    # Check if block is already on target device
+                    first_param = next(block.parameters(), None)
+                    if first_param is not None and first_param.device == self.device:
+                        # Block is already on target device, skip moving
+                        continue
+                except (StopIteration, RuntimeError):
+                    # Can't check device, move to be safe
+                    pass
                 block.to(self.device)
             return
 

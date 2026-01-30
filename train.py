@@ -323,9 +323,15 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
                 print(f'Generated {len(images)} sample images in {save_dir}')
                 
     finally:
+        # Ensure proper cleanup order:
+        # 1. VAE should already be moved to CPU in generate_samples()
+        # 2. Clear CUDA cache to free any remaining GPU memory
+        # 3. Then restore block swap training state (which may move blocks to GPU)
         empty_cuda_cache()
         model.prepare_block_swap_training()
         model.prepare_text_encoder_block_swap_training()
+        # Clear cache again after restoring training state to ensure clean state
+        empty_cuda_cache()
 
 
 def distributed_init(args):

@@ -896,7 +896,17 @@ class QwenImagePipeline(BasePipeline):
         
         # Decode with VAE
         vae = self.get_vae()
-        vae.to(device)
+        # Handle meta tensors before moving to device
+        try:
+            vae.to(device)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                # Some parameters/buffers on meta device - manually move them
+                self._move_meta_tensors_to_device(vae, device)
+                # Try again after moving meta tensors
+                vae.to(device)
+            else:
+                raise
         
         # Apply VAE normalization reversal
         final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
@@ -911,6 +921,9 @@ class QwenImagePipeline(BasePipeline):
             decoded = decoded.sample
         elif isinstance(decoded, dict):
             decoded = decoded['sample']
+        
+        # Move VAE back to CPU to free GPU memory before block swap restoration
+        vae.to('cpu')
         
         # Convert to PIL images
         images = []
