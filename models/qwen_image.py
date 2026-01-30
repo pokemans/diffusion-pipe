@@ -889,7 +889,7 @@ class QwenImagePipeline(BasePipeline):
                         hidden_states=latents,
                         timestep=t_tensor,
                         encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_embeds,
+                        class_labels=pooled_embeds,
                         return_dict=False
                     )[0]
 
