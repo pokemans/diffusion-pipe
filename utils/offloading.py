@@ -407,8 +407,22 @@ class ModelOffloader(Offloader):
                 weights_to_device(b, torch.device('cpu'))
                 verify_module_on_device(b, torch.device('cpu'), f"block_{block_idx}")
 
+        # Synchronize to ensure all device moves are complete before any forward passes
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
+        
+        if self.debug:
+            print(f"[{self.block_type}] Finished preparing block devices. All blocks should be on correct device.")
+            # Verify a sample block is on the correct device
+            if len(self.blocks) > 0:
+                sample_block = self.blocks[0]
+                sample_params = list(sample_block.named_parameters())[:2]
+                for param_name, param in sample_params:
+                    expected_device = self.device if 0 < self.num_blocks - self.blocks_to_swap else torch.device('cpu')
+                    if param.device.type != expected_device.type:
+                        print(f"[{self.block_type}] WARNING: Sample parameter {param_name} is on {param.device}, expected {expected_device}")
+                    else:
+                        print(f"[{self.block_type}] Verified sample parameter {param_name} is on {param.device}")
 
     def wait_for_block(self, block_idx: int):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
@@ -416,6 +430,10 @@ class ModelOffloader(Offloader):
         if self.reentrant_activation_checkpointing and torch.is_grad_enabled():
             # Second forward pass, don't do block swapping
             return
+        
+        if self.debug:
+            print(f"[{self.block_type}] wait_for_block called for block {block_idx}")
+        
         self._wait_blocks_move(block_idx)
         # After waiting, ensure the block is fully on device (all params and buffers)
         # This is important because swap_weight_devices might not move all buffers
@@ -429,31 +447,56 @@ class ModelOffloader(Offloader):
         # Explicitly move ALL parameters to ensure nothing is missed
         # This is critical for nested submodules like input_layernorm.weight
         # Use blocking moves here since we're right before forward pass - need to ensure completion
+        params_moved = 0
+        params_on_wrong_device = []
         for param_name, param in block.named_parameters():
             if param.device.type != self.device.type:
                 if 'lora' not in param_name:  # Skip LoRA params when moving to CPU
+                    if self.debug:
+                        print(f"[{self.block_type}] Moving parameter {param_name} from {param.device} to {self.device}")
                     # Use blocking move to ensure parameter is on device before forward pass
-                    # Direct assignment to .data should update the parameter's device tracking
+                    # Direct assignment to .data updates the parameter's device tracking
                     param.data = param.data.to(self.device, non_blocking=False)
-                    # Double-check the parameter is now on device
+                    params_moved += 1
+                    # Verify the parameter is now on device (check immediately after move)
+                    # Note: param.device should update automatically, but we verify to be sure
                     if param.device.type != self.device.type:
-                        # If still not on device, try accessing the parameter through its module
-                        for name, module in block.named_modules():
-                            if param_name in dict(module.named_parameters(recurse=False)):
-                                # Get the parameter from the module and move it
-                                module_param = dict(module.named_parameters(recurse=False))[param_name]
-                                module_param.data = module_param.data.to(self.device, non_blocking=False)
+                        params_on_wrong_device.append((param_name, param.device))
+        
+        if self.debug and params_moved > 0:
+            print(f"[{self.block_type}] Moved {params_moved} parameters for block {block_idx}")
+        
+        # Check for parameters still on wrong device (this should be rare)
+        if params_on_wrong_device:
+            if self.debug:
+                print(f"[{self.block_type}] WARNING: {len(params_on_wrong_device)} parameters still on wrong device after move")
+            # Try moving them again through their parent modules
+            for param_name, wrong_device in params_on_wrong_device:
+                for module_name, module in block.named_modules():
+                    if param_name.endswith(module_name) or param_name.startswith(module_name):
+                        for mod_param_name, mod_param in module.named_parameters(recurse=False):
+                            if mod_param_name in param_name or param_name.endswith(mod_param_name):
+                                mod_param.data = mod_param.data.to(self.device, non_blocking=False)
+                                if self.debug:
+                                    print(f"[{self.block_type}] Retried moving {param_name} through module {module_name}")
                                 break
         
         # Move all buffers explicitly with blocking moves
+        buffers_moved = 0
         for buffer_name, buffer in block.named_buffers():
             if buffer is not None and buffer.device.type != self.device.type:
+                if self.debug:
+                    print(f"[{self.block_type}] Moving buffer {buffer_name} from {buffer.device} to {self.device}")
                 # Find the module that owns this buffer and update it
                 for name, module in block.named_modules():
                     if buffer_name in dict(module.named_buffers(recurse=False)):
                         # Use blocking move for buffers too
                         module.register_buffer(buffer_name, buffer.to(self.device, non_blocking=False))
+                        buffers_moved += 1
                         break
+        
+        if self.debug and buffers_moved > 0:
+            print(f"[{self.block_type}] Moved {buffers_moved} buffers for block {block_idx}")
         
         # Use weights_to_device as double-check (this uses non_blocking, but we've already moved above)
         weights_to_device(block, self.device)
@@ -464,6 +507,15 @@ class ModelOffloader(Offloader):
         # Synchronize to ensure all moves are complete before forward pass
         # This is critical to prevent device mismatch errors
         synchronize_device(self.device)
+        
+        if self.debug:
+            # Final verification - check a few key parameters
+            sample_params = list(block.named_parameters())[:3]
+            for param_name, param in sample_params:
+                if param.device.type != self.device.type:
+                    print(f"[{self.block_type}] ERROR: Parameter {param_name} still on {param.device} after wait_for_block!")
+                else:
+                    print(f"[{self.block_type}] Verified parameter {param_name} is on {param.device}")
 
     def submit_move_blocks_forward(self, block_idx: int):
         # check if blocks_to_swap is enabled
