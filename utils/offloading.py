@@ -640,6 +640,11 @@ class ModelOffloader(Offloader):
                             module.__dict__[param_name] = new_param
                         setattr(module, param_name, new_param)
                         
+                        # CRITICAL: Call .to(device) on the module after recreating parameters
+                        # This ensures PyTorch's internal module state recognizes the device change
+                        # This is essential for modules like input_layernorm where forward() accesses self.weight
+                        module.to(self.device)
+                        
                         # Update param reference for verification below
                         param = new_param
                         
@@ -889,20 +894,28 @@ class ModelOffloader(Offloader):
                             parent_layer._parameters[param_name] = new_param
                         if param_name in parent_layer.__dict__:
                             parent_layer.__dict__[param_name] = new_param
-                        setattr(parent_layer, param_name, new_param)
-                    else:
-                        # Nested parameter, find the submodule
-                        module_path = '.'.join(parts[:-1])
-                        param_attr = parts[-1]
-                        for name, module in parent_layer.named_modules():
-                            if name == module_path or name.endswith(module_path):
-                                module.register_parameter(param_attr, new_param)
-                                if hasattr(module, '_parameters') and param_attr in module._parameters:
-                                    module._parameters[param_attr] = new_param
-                                if param_attr in module.__dict__:
-                                    module.__dict__[param_attr] = new_param
-                                setattr(module, param_attr, new_param)
-                                break
+                            setattr(parent_layer, param_name, new_param)
+                            
+                            # CRITICAL: Call .to(device) on parent_layer after recreating parameter
+                            parent_layer.to(self.device)
+                        else:
+                            # Nested parameter, find the submodule
+                            module_path = '.'.join(parts[:-1])
+                            param_attr = parts[-1]
+                            for name, module in parent_layer.named_modules():
+                                if name == module_path or name.endswith(module_path):
+                                    module.register_parameter(param_attr, new_param)
+                                    if hasattr(module, '_parameters') and param_attr in module._parameters:
+                                        module._parameters[param_attr] = new_param
+                                    if param_attr in module.__dict__:
+                                        module.__dict__[param_attr] = new_param
+                                    setattr(module, param_attr, new_param)
+                                    
+                                    # CRITICAL: Call .to(device) on the module after recreating parameter
+                                    # This ensures PyTorch's internal module state recognizes the device change
+                                    module.to(self.device)
+                                    
+                                    break
             
             # CRITICAL: Force update of specific attributes that forward() will access directly
             # Instead of calling .to(device) which might interfere, we directly update the exact
@@ -935,8 +948,14 @@ class ModelOffloader(Offloader):
                         input_layernorm.__dict__['weight'] = new_weight
                     # Also use setattr to ensure attribute access works
                     setattr(input_layernorm, 'weight', new_weight)
+                    
+                    # CRITICAL: Call .to(device) on input_layernorm module after recreating weight Parameter
+                    # This ensures PyTorch's internal module state recognizes the device change
+                    # This is essential because forward() accesses self.weight through the module
+                    input_layernorm.to(self.device)
+                    
                     if self.debug:
-                        print(f"[{self.block_type}] Recreated input_layernorm.weight Parameter object and updated all reference paths")
+                        print(f"[{self.block_type}] Recreated input_layernorm.weight Parameter object, updated all reference paths, and called input_layernorm.to({self.device})")
             
         # Also update post_attention_layernorm.weight if it exists
         if hasattr(parent_layer, 'post_attention_layernorm'):
@@ -955,9 +974,12 @@ class ModelOffloader(Offloader):
                     
                     if hasattr(post_layernorm, '_parameters') and 'weight' in post_layernorm._parameters:
                         post_layernorm._parameters['weight'] = new_weight
-                    if 'weight' in post_layernorm.__dict__:
-                        post_layernorm.__dict__['weight'] = new_weight
-                    setattr(post_layernorm, 'weight', new_weight)
+                        if 'weight' in post_layernorm.__dict__:
+                            post_layernorm.__dict__['weight'] = new_weight
+                        setattr(post_layernorm, 'weight', new_weight)
+                        
+                        # CRITICAL: Call .to(device) on post_attention_layernorm module after recreating weight Parameter
+                        post_layernorm.to(self.device)
         
         # Direct access test: Check if input_layernorm.weight is accessible and on correct device
         # This is a critical test because input_layernorm is a nested submodule that was causing issues
@@ -1055,11 +1077,17 @@ class ModelOffloader(Offloader):
                         if 'weight' in input_layernorm.__dict__:
                             input_layernorm.__dict__['weight'] = new_weight
                         setattr(input_layernorm, 'weight', new_weight)
+                        
+                        # CRITICAL: Call .to(device) on input_layernorm module after recreating weight Parameter
+                        input_layernorm.to(self.device)
+                        
                         if self.debug:
-                            print(f"[{self.block_type}] FINAL CHECK: Recreated input_layernorm.weight Parameter and forced to {self.device.type}")
+                            print(f"[{self.block_type}] FINAL CHECK: Recreated input_layernorm.weight Parameter, updated all references, called input_layernorm.to({self.device}), and forced to {self.device.type}")
                     else:
+                        # Even if weight is already on correct device, call .to(device) to ensure module state is synchronized
+                        input_layernorm.to(self.device)
                         if self.debug:
-                            print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight confirmed on {weight_device}")
+                            print(f"[{self.block_type}] FINAL CHECK: input_layernorm.weight confirmed on {weight_device}, called input_layernorm.to({self.device}) to sync module state")
         
         # Final explicit CUDA synchronization before forward pass
         # This ensures all parameter moves are complete and visible before the forward pass executes

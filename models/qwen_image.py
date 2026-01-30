@@ -408,8 +408,13 @@ class QwenImagePipeline(BasePipeline):
                                     if 'weight' in module.input_layernorm.__dict__:
                                         module.input_layernorm.__dict__['weight'] = new_weight
                                     setattr(module.input_layernorm, 'weight', new_weight)
+                                    
+                                    # CRITICAL: Call .to(device) on input_layernorm module after recreating weight Parameter
+                                    # This ensures PyTorch's internal module state recognizes the device change
+                                    module.input_layernorm.to('cuda')
+                                    
                                     if offloader_ref.debug:
-                                        print(f'[HOOK DEBUG] Recreated input_layernorm.weight Parameter and forced to CUDA in hook')
+                                        print(f'[HOOK DEBUG] Recreated input_layernorm.weight Parameter, updated all references, and called input_layernorm.to(cuda)')
                             
                             # Final CUDA synchronization to ensure all moves are complete
                             import torch
