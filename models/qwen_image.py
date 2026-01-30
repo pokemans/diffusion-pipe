@@ -297,6 +297,29 @@ class QwenImagePipeline(BasePipeline):
     def get_text_encoders(self):
         return [self.text_encoder]
 
+    def _log_vram_usage(self, context, previous_allocated=None):
+        """
+        Log current VRAM usage with optional delta calculation.
+        
+        Args:
+            context: String describing the context/location of this measurement
+            previous_allocated: Previous allocated memory in bytes (for delta calculation)
+        """
+        if not torch.cuda.is_available():
+            return None
+        
+        allocated_bytes = torch.cuda.memory_allocated()
+        allocated_gb = allocated_bytes / (1024 ** 3)
+        
+        if previous_allocated is not None:
+            delta_bytes = allocated_bytes - previous_allocated
+            delta_gb = delta_bytes / (1024 ** 3)
+            print(f'[VRAM] {context}: {allocated_gb:.2f}GB allocated, {delta_gb:+.2f}GB delta')
+        else:
+            print(f'[VRAM] {context}: {allocated_gb:.2f}GB allocated')
+        
+        return allocated_bytes
+
     def _move_meta_tensors_to_device(self, module, target_device):
         """
         Recursively move all parameters and buffers from meta device to target device.
@@ -807,9 +830,15 @@ class QwenImagePipeline(BasePipeline):
         import torchvision
         import numpy as np
         
+        # Baseline VRAM measurement
+        vram_allocated = self._log_vram_usage("Function start (baseline)")
+        
         # Get device and dtype
         device = next(self.transformer.parameters()).device
         dtype = self.model_config['dtype']
+        
+        # Check if accessing transformer triggers loading
+        vram_allocated = self._log_vram_usage("After accessing transformer", vram_allocated)
         
         # Round height/width to multiple of pixels_round_to_multiple (32)
         height = ((height + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
@@ -860,6 +889,7 @@ class QwenImagePipeline(BasePipeline):
                     prompt_embeds_single = cached_embed.to(device, dtype)
                     use_cached = True
                     print(f'Using cached embedding for prompt {prompt_idx + 1}')
+                    vram_allocated = self._log_vram_usage(f"After moving cached embedding to device (prompt {prompt_idx + 1})", vram_allocated)
             
             # If not using cached embedding, compute new one
             if not use_cached:
@@ -890,9 +920,11 @@ class QwenImagePipeline(BasePipeline):
                                     language_model.model.layers = None
                                     try:
                                         text_encoder.to(device)
+                                        vram_allocated = self._log_vram_usage(f"After moving text encoder to device (prompt {prompt_idx + 1})", vram_allocated)
                                     except NotImplementedError as e:
                                         if "meta tensor" in str(e):
                                             self._move_meta_tensors_to_device(text_encoder, device)
+                                            vram_allocated = self._log_vram_usage(f"After moving text encoder meta tensors (prompt {prompt_idx + 1})", vram_allocated)
                                         else:
                                             raise
                                     finally:
@@ -900,9 +932,11 @@ class QwenImagePipeline(BasePipeline):
                                 else:
                                     try:
                                         text_encoder.to(device)
+                                        vram_allocated = self._log_vram_usage(f"After moving text encoder to device (fallback, prompt {prompt_idx + 1})", vram_allocated)
                                     except NotImplementedError as e:
                                         if "meta tensor" in str(e):
                                             self._move_meta_tensors_to_device(text_encoder, device)
+                                            vram_allocated = self._log_vram_usage(f"After moving text encoder meta tensors (fallback, prompt {prompt_idx + 1})", vram_allocated)
                                         else:
                                             raise
                 
@@ -914,6 +948,7 @@ class QwenImagePipeline(BasePipeline):
                 )
                 prompt_embeds_single = prompt_embeds_list[0]  # Single prompt, no padding needed
                 prompt_embeds_single = prompt_embeds_single.to(device, dtype)
+                vram_allocated = self._log_vram_usage(f"After computing new embedding (prompt {prompt_idx + 1})", vram_allocated)
             
             # Create attention mask for single prompt
             max_text_len = prompt_embeds_single.size(0)
@@ -926,6 +961,7 @@ class QwenImagePipeline(BasePipeline):
             
             # Initialize latents with random noise (batch size = 1)
             x_t = torch.randn(1, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
+            vram_allocated = self._log_vram_usage(f"After creating latents tensor (prompt {prompt_idx + 1})", vram_allocated)
             
             # Create attention mask for single prompt (batch size = 1)
             img_attention_mask = torch.ones((1, expected_img_seq_len), dtype=torch.bool, device=device)
@@ -957,7 +993,9 @@ class QwenImagePipeline(BasePipeline):
                     
                     # Forward through layers
                     model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
+                    vram_allocated = self._log_vram_usage(f"Before to_layers() call (step {i+1}/{num_inference_steps}, prompt {prompt_idx + 1})", vram_allocated)
                     layers = self.to_layers()
+                    vram_allocated = self._log_vram_usage(f"After to_layers() call (step {i+1}/{num_inference_steps}, prompt {prompt_idx + 1})", vram_allocated)
                     predicted_target_packed = model_inputs
                     for layer in layers:
                         predicted_target_packed = layer(predicted_target_packed)
@@ -969,6 +1007,9 @@ class QwenImagePipeline(BasePipeline):
                     # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
                     x_t = x_t - dt * predicted_target
                     
+                    # Log after first sampling step
+                    if i == 0:
+                        vram_allocated = self._log_vram_usage(f"After first sampling step (prompt {prompt_idx + 1})", vram_allocated)
             
             # After sampling, x_t should be close to x_1 (clean latents)
             latents = x_t      
@@ -979,12 +1020,34 @@ class QwenImagePipeline(BasePipeline):
             latents_for_vae = latents_for_vae * std_tensor + mean_tensor
             
             # Decode with VAE - diffusers VAE expects (B, C, H, W)
+            vae = self.get_vae()
+            vram_allocated = self._log_vram_usage(f"Before VAE decode (prompt {prompt_idx + 1})", vram_allocated)
+            # Handle meta tensors before moving to device
+            try:
+                vae.to(device)
+            except NotImplementedError as e:
+                if "meta tensor" in str(e):
+                    # Some parameters/buffers on meta device - manually move them
+                    self._move_meta_tensors_to_device(vae, device)
+                    # Try again after moving meta tensors
+                    vae.to(device)
+                else:
+                    raise
+            vram_allocated = self._log_vram_usage(f"After moving VAE to device (prompt {prompt_idx + 1})", vram_allocated)
+            
             with torch.no_grad():
-                print(f'decoding with vae')                # Handle VAE output
+                print(f'decoding with vae')
+                decoded = vae.decode(latents_for_vae.to(vae.device, vae.dtype))
+                vram_allocated = self._log_vram_usage(f"After VAE decode (prompt {prompt_idx + 1})", vram_allocated)
+                
                 if hasattr(decoded, 'sample'):
                     decoded = decoded.sample
                 elif isinstance(decoded, dict):
                     decoded = decoded['sample']
+                
+                # Move VAE back to CPU to free GPU memory before block swap restoration
+                vae.to('cpu')
+                vram_allocated = self._log_vram_usage(f"After moving VAE to CPU (prompt {prompt_idx + 1})", vram_allocated)
                 
                 # Ensure format is (B, C, H, W)
                 if decoded.dim() == 4 and decoded.shape[-1] == 3:
@@ -1002,7 +1065,9 @@ class QwenImagePipeline(BasePipeline):
         
         # Clear CUDA cache after all prompts are processed
         # Note: VAE device cleanup is handled by train.py's finally block
+        vram_allocated = self._log_vram_usage("Function end (before cache clear)", vram_allocated)
         torch.cuda.empty_cache()
+        vram_allocated = self._log_vram_usage("Function end (after cache clear)", vram_allocated)
         
         return images
         
