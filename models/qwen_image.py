@@ -827,12 +827,6 @@ class QwenImagePipeline(BasePipeline):
         # Prepare for inference (once, reused for all prompts)
         #self.transformer.eval()
         # self.prepare_block_swap_inference(disable_block_swap=False)
-
-        vae = self.get_vae()
-        vae.eval()
-        self._move_meta_tensors_to_device(vae, 'cpu')
-        vae.to('cpu')
-        print(f'VAE is prepared')
         
         # Pre-compute constants
         num_frames = 1  # For images
@@ -845,8 +839,6 @@ class QwenImagePipeline(BasePipeline):
         
         # Process each prompt sequentially
         for prompt_idx, prompt in enumerate(prompts):
-            # Initialize prompt_embeds to avoid UnboundLocalError (Python sees del later in function)
-            prompt_embeds = None
             print(f'Processing prompt {prompt_idx + 1}/{len(prompts)}: {prompt}')
             
             # Set random seed for this prompt (seed + prompt_idx for different results)
@@ -871,6 +863,7 @@ class QwenImagePipeline(BasePipeline):
             
             # If not using cached embedding, compute new one
             if not use_cached:
+                print(f'Computing new embedding for prompt {prompt_idx + 1}')
                 # Ensure text encoder is on the correct device before encoding
                 # Check if text encoder block swapping is enabled
                 use_block_swap = (self.text_encoder_offloader is not None and 
@@ -930,8 +923,6 @@ class QwenImagePipeline(BasePipeline):
             # Initialize prompt_embeds before loop to avoid UnboundLocalError (Python sees del later)
             prompt_embeds = prompt_embeds_single.unsqueeze(0)  # (1, seq_len, hidden_dim)
             prompt_embeds_mask = prompt_embeds_mask_single.unsqueeze(0)  # (1, seq_len)
-
-            del prompt_embeds_single, prompt_embeds_mask_single
             
             # Initialize latents with random noise (batch size = 1)
             x_t = torch.randn(1, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
@@ -941,7 +932,6 @@ class QwenImagePipeline(BasePipeline):
             attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
             attention_mask = attention_mask.view(1, 1, 1, -1)
             
-            del prompt_embeds_mask, img_attention_mask
             # Flow matching sampling: Euler steps from t=1.0 to t=0.0
             with torch.no_grad():
                 print(f'Starting sampling loop')
@@ -981,14 +971,7 @@ class QwenImagePipeline(BasePipeline):
                     
             
             # After sampling, x_t should be close to x_1 (clean latents)
-            latents = x_t
-            # Prepare VAE for decoding (lazy load - only when needed)
-            # Load once on first use, then reuse for subsequent prompts
-            # Handle meta tensors before moving to device
-            self._move_meta_tensors_to_device(vae, device)
-            vae.to(device)
-            print(f'VAE is prepared')
-            
+            latents = x_t      
             mean_tensor = self.vae.latents_mean_tensor.squeeze(2)  # (1, z_dim, 1, 1)
             std_tensor = self.vae.latents_std_tensor.squeeze(2)  # (1, z_dim, 1, 1)
 
@@ -997,13 +980,7 @@ class QwenImagePipeline(BasePipeline):
             
             # Decode with VAE - diffusers VAE expects (B, C, H, W)
             with torch.no_grad():
-                print(f'Decoding with VAE')
-                decoded = self.vae.decode(latents_for_vae.to(vae.device, vae.dtype))
-                print(f'VAE decoded')
-                self._move_meta_tensors_to_device(vae, 'cpu')
-                vae.to('cpu')
-                print(f'VAE moved to CPU')
-                # Handle VAE output
+                print(f'decoding with vae')                # Handle VAE output
                 if hasattr(decoded, 'sample'):
                     decoded = decoded.sample
                 elif isinstance(decoded, dict):
@@ -1021,14 +998,7 @@ class QwenImagePipeline(BasePipeline):
                 # Convert to PIL
                 pil_img = torchvision.transforms.functional.to_pil_image(img)
                 images.append(pil_img)
-                
-                # Delete decoded tensor and latents to free VRAM
-                del decoded, latents_for_vae, latents
-            
-            # Clean up prompt embeddings and other temporary tensors
-            del prompt_embeds_single, prompt_embeds, x_t, img_attention_mask
-            # Clear CUDA cache after each prompt
-            torch.cuda.empty_cache()
+                          
         
         # Clear CUDA cache after all prompts are processed
         # Note: VAE device cleanup is handled by train.py's finally block
