@@ -872,7 +872,7 @@ class ModelOffloader(Offloader):
                 # Access device property to force reference update
                 actual_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
                 if actual_device != self.device.type:
-                   if self.debug:
+                    if self.debug:
                         print(f"[{self.block_type}] Parent model param {param_name} still on {actual_device}, moving to {self.device.type}")
                     # Move parameter through parent model structure
                     param.data = param.data.to(self.device, non_blocking=False)
