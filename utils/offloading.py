@@ -871,38 +871,38 @@ class ModelOffloader(Offloader):
             for param_name, param in parent_layer.named_parameters():
                 # Access device property to force reference update
                 actual_device = param.data.device.type if hasattr(param.data, 'device') else param.device.type
-                    if actual_device != self.device.type:
-                        if self.debug:
-                            print(f"[{self.block_type}] Parent model param {param_name} still on {actual_device}, moving to {self.device.type}")
-                        # Move parameter through parent model structure
-                        param.data = param.data.to(self.device, non_blocking=False)
+                if actual_device != self.device.type:
+                   if self.debug:
+                        print(f"[{self.block_type}] Parent model param {param_name} still on {actual_device}, moving to {self.device.type}")
+                    # Move parameter through parent model structure
+                    param.data = param.data.to(self.device, non_blocking=False)
                         
-                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
-                        new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
+                    # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                    new_param = nn.Parameter(param.data, requires_grad=param.requires_grad)
                         
-                        # Update parent module's internal state
-                        parts = param_name.split('.')
-                        if len(parts) == 1:
-                            # Direct parameter on parent layer
-                            parent_layer.register_parameter(param_name, new_param)
-                            if hasattr(parent_layer, '_parameters') and param_name in parent_layer._parameters:
-                                parent_layer._parameters[param_name] = new_param
-                            if param_name in parent_layer.__dict__:
-                                parent_layer.__dict__[param_name] = new_param
-                            setattr(parent_layer, param_name, new_param)
-                        else:
-                            # Nested parameter, find the submodule
-                            module_path = '.'.join(parts[:-1])
-                            param_attr = parts[-1]
-                            for name, module in parent_layer.named_modules():
-                                if name == module_path or name.endswith(module_path):
-                                    module.register_parameter(param_attr, new_param)
-                                    if hasattr(module, '_parameters') and param_attr in module._parameters:
-                                        module._parameters[param_attr] = new_param
-                                    if param_attr in module.__dict__:
-                                        module.__dict__[param_attr] = new_param
-                                    setattr(module, param_attr, new_param)
-                                    break
+                    # Update parent module's internal state
+                    parts = param_name.split('.')
+                    if len(parts) == 1:
+                        # Direct parameter on parent layer
+                        parent_layer.register_parameter(param_name, new_param)
+                        if hasattr(parent_layer, '_parameters') and param_name in parent_layer._parameters:
+                            parent_layer._parameters[param_name] = new_param
+                        if param_name in parent_layer.__dict__:
+                            parent_layer.__dict__[param_name] = new_param
+                        setattr(parent_layer, param_name, new_param)
+                    else:
+                        # Nested parameter, find the submodule
+                        module_path = '.'.join(parts[:-1])
+                        param_attr = parts[-1]
+                        for name, module in parent_layer.named_modules():
+                            if name == module_path or name.endswith(module_path):
+                                module.register_parameter(param_attr, new_param)
+                                if hasattr(module, '_parameters') and param_attr in module._parameters:
+                                    module._parameters[param_attr] = new_param
+                                if param_attr in module.__dict__:
+                                    module.__dict__[param_attr] = new_param
+                                setattr(module, param_attr, new_param)
+                                break
             
             # CRITICAL: Force update of specific attributes that forward() will access directly
             # Instead of calling .to(device) which might interfere, we directly update the exact
@@ -910,54 +910,54 @@ class ModelOffloader(Offloader):
             # This ensures forward() sees the CUDA tensor through the same reference path
             
             # Update input_layernorm.weight - this is the exact attribute forward() accesses
-            if hasattr(parent_layer, 'input_layernorm'):
-                input_layernorm = parent_layer.input_layernorm
-                if hasattr(input_layernorm, 'weight'):
-                    # Access through exact path forward() uses: self.input_layernorm.weight
-                    weight = input_layernorm.weight
-                    weight_device = weight.data.device.type if hasattr(weight.data, 'device') else weight.device.type
-                    if weight_device != self.device.type:
-                        if self.debug:
-                            print(f"[{self.block_type}] Direct attribute update: Moving input_layernorm.weight from {weight_device} to {self.device.type}")
-                        # Move through exact reference forward() uses
-                        weight.data = weight.data.to(self.device, non_blocking=False)
+        if hasattr(parent_layer, 'input_layernorm'):
+            input_layernorm = parent_layer.input_layernorm
+            if hasattr(input_layernorm, 'weight'):
+                # Access through exact path forward() uses: self.input_layernorm.weight
+                weight = input_layernorm.weight
+                weight_device = weight.data.device.type if hasattr(weight.data, 'device') else weight.device.type
+                if weight_device != self.device.type:
+                    if self.debug:
+                        print(f"[{self.block_type}] Direct attribute update: Moving input_layernorm.weight from {weight_device} to {self.device.type}")
+                    # Move through exact reference forward() uses
+                    weight.data = weight.data.to(self.device, non_blocking=False)
+                    
+                    # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                    # This ensures that when forward() accesses self.weight, it sees the CUDA Parameter
+                    new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
+                    input_layernorm.register_parameter('weight', new_weight)
                         
-                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
-                        # This ensures that when forward() accesses self.weight, it sees the CUDA Parameter
-                        new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
-                        input_layernorm.register_parameter('weight', new_weight)
-                        
-                        # Force update of module's internal state through multiple paths
-                        if hasattr(input_layernorm, '_parameters') and 'weight' in input_layernorm._parameters:
-                            input_layernorm._parameters['weight'] = new_weight
-                        # Update __dict__ to ensure no cached references exist
-                        if 'weight' in input_layernorm.__dict__:
-                            input_layernorm.__dict__['weight'] = new_weight
-                        # Also use setattr to ensure attribute access works
-                        setattr(input_layernorm, 'weight', new_weight)
-                        if self.debug:
-                            print(f"[{self.block_type}] Recreated input_layernorm.weight Parameter object and updated all reference paths")
+                    # Force update of module's internal state through multiple paths
+                    if hasattr(input_layernorm, '_parameters') and 'weight' in input_layernorm._parameters:
+                        input_layernorm._parameters['weight'] = new_weight
+                    # Update __dict__ to ensure no cached references exist
+                    if 'weight' in input_layernorm.__dict__:
+                        input_layernorm.__dict__['weight'] = new_weight
+                    # Also use setattr to ensure attribute access works
+                    setattr(input_layernorm, 'weight', new_weight)
+                    if self.debug:
+                        print(f"[{self.block_type}] Recreated input_layernorm.weight Parameter object and updated all reference paths")
             
-            # Also update post_attention_layernorm.weight if it exists
-            if hasattr(parent_layer, 'post_attention_layernorm'):
-                post_layernorm = parent_layer.post_attention_layernorm
-                if hasattr(post_layernorm, 'weight'):
-                    weight = post_layernorm.weight
-                    weight_device = weight.data.device.type if hasattr(weight.data, 'device') else weight.device.type
-                    if weight_device != self.device.type:
-                        if self.debug:
-                            print(f"[{self.block_type}] Direct attribute update: Moving post_attention_layernorm.weight from {weight_device} to {self.device.type}")
-                        weight.data = weight.data.to(self.device, non_blocking=False)
+        # Also update post_attention_layernorm.weight if it exists
+        if hasattr(parent_layer, 'post_attention_layernorm'):
+            post_layernorm = parent_layer.post_attention_layernorm
+            if hasattr(post_layernorm, 'weight'):
+                weight = post_layernorm.weight
+                weight_device = weight.data.device.type if hasattr(weight.data, 'device') else weight.device.type
+                if weight_device != self.device.type:
+                    if self.debug:
+                        print(f"[{self.block_type}] Direct attribute update: Moving post_attention_layernorm.weight from {weight_device} to {self.device.type}")
+                    weight.data = weight.data.to(self.device, non_blocking=False)
                         
-                        # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
-                        new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
-                        post_layernorm.register_parameter('weight', new_weight)
-                        
-                        if hasattr(post_layernorm, '_parameters') and 'weight' in post_layernorm._parameters:
-                            post_layernorm._parameters['weight'] = new_weight
-                        if 'weight' in post_layernorm.__dict__:
-                            post_layernorm.__dict__['weight'] = new_weight
-                        setattr(post_layernorm, 'weight', new_weight)
+                    # CRITICAL: Recreate Parameter object to force PyTorch to recognize device change
+                    new_weight = nn.Parameter(weight.data, requires_grad=weight.requires_grad)
+                    post_layernorm.register_parameter('weight', new_weight)
+                    
+                    if hasattr(post_layernorm, '_parameters') and 'weight' in post_layernorm._parameters:
+                        post_layernorm._parameters['weight'] = new_weight
+                    if 'weight' in post_layernorm.__dict__:
+                        post_layernorm.__dict__['weight'] = new_weight
+                    setattr(post_layernorm, 'weight', new_weight)
         
         # Direct access test: Check if input_layernorm.weight is accessible and on correct device
         # This is a critical test because input_layernorm is a nested submodule that was causing issues
