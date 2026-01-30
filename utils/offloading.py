@@ -121,11 +121,19 @@ def weights_to_device(layer: nn.Module, device: torch.device):
     This is more thorough than just calling .to() on the module when dealing with
     blocks that are part of a parent model structure.
     Recursively handles all submodules and ensures all buffers are moved.
+    Explicitly iterates through ALL parameters to ensure nothing is missed.
     """
     for name, module in layer.named_modules():
         if device.type == 'cpu' and 'lora' in name:
             continue
-        # Move weights
+        
+        # Explicitly move ALL parameters (not just those with weight/bias attributes)
+        # This ensures parameters like input_layernorm.weight are moved correctly
+        for param_name, param in module.named_parameters(recurse=False):
+            if param.device.type != device.type:
+                param.data = param.data.to(device, non_blocking=True)
+        
+        # Also handle weight/bias attributes as additional safety (covers edge cases)
         if hasattr(module, "weight") and module.weight is not None:
             if module.weight.device.type != device.type:
                 module.weight.data = module.weight.data.to(device, non_blocking=True)
@@ -133,6 +141,7 @@ def weights_to_device(layer: nn.Module, device: torch.device):
         if hasattr(module, "bias") and module.bias is not None:
             if module.bias.device.type != device.type:
                 module.bias.data = module.bias.data.to(device, non_blocking=True)
+        
         # Move buffers (like LayerNorm's running_mean, running_var, or weight/bias in some cases)
         # Use named_buffers(recurse=False) to get buffers directly on this module
         for buffer_name, buffer in module.named_buffers(recurse=False):
@@ -151,22 +160,28 @@ def verify_module_on_device(module: nn.Module, device: torch.device, module_name
     Verify that all parameters and buffers in a module are on the specified device.
     Returns True if all components are on device, False otherwise.
     Also moves any components found on wrong device.
+    This function explicitly checks ALL parameters and buffers to ensure nothing is missed.
     """
     all_on_device = True
     for name, submodule in module.named_modules():
         full_name = f"{module_name}.{name}" if module_name else name
-        # Check parameters
+        
+        # Check ALL parameters explicitly (not just those with weight/bias attributes)
+        # This ensures parameters like input_layernorm.weight are caught
         for param_name, param in submodule.named_parameters(recurse=False):
             if param.device.type != device.type:
                 if 'lora' not in full_name:  # Skip LoRA params when moving to CPU
+                    # Move parameter data to device
+                    # Note: param.device updates automatically after data assignment
                     param.data = param.data.to(device, non_blocking=True)
                     all_on_device = False
+        
         # Check buffers
         for buffer_name, buffer in submodule.named_buffers(recurse=False):
             if buffer is not None and buffer.device.type != device.type:
                 submodule.register_buffer(buffer_name, buffer.to(device, non_blocking=True))
                 all_on_device = False
-        # Also check _buffers dict
+        # Also check _buffers dict directly to catch any buffers not registered properly
         for buffer_name in list(submodule._buffers.keys()):
             buffer = submodule._buffers.get(buffer_name)
             if buffer is not None and buffer.device.type != device.type:
@@ -344,17 +359,16 @@ class ModelOffloader(Offloader):
                 # For blocks on CPU, we need to move them carefully to avoid OOM
                 # Explicitly move all parameters and buffers first, then move structure
                 try:
-                    # Move all parameters explicitly
-                    for param in b.parameters():
+                    # Explicitly move ALL parameters (not just those accessed via .parameters())
+                    # This ensures nested submodules like input_layernorm.weight are moved
+                    for param_name, param in b.named_parameters():
                         if param.device.type != self.device.type:
-                            param.data = param.data.to(self.device, non_blocking=True)
-                    # Move all buffers explicitly (important for LayerNorm, etc.)
-                    for buffer in b.buffers():
-                        if buffer.device.type != self.device.type:
-                            buffer.data = buffer.data.to(self.device, non_blocking=True)
+                            if 'lora' not in param_name:  # Skip LoRA params
+                                param.data = param.data.to(self.device, non_blocking=True)
+                    # Buffers will be handled by weights_to_device() below
                     # Then move the block structure itself (handles any edge cases)
                     b.to(self.device)
-                    # Use weights_to_device to ensure all nested components are moved
+                    # Use weights_to_device to ensure all nested components are moved (double-check)
                     weights_to_device(b, self.device)
                     # Verify all components are on device
                     verify_module_on_device(b, self.device, f"block_{i}")
@@ -371,6 +385,7 @@ class ModelOffloader(Offloader):
                     verify_module_on_device(b, self.device, f"block_{i}")
             else:
                 b.to(self.device)
+                # Explicitly move all parameters to ensure nothing is missed
                 weights_to_device(b, self.device)  # make sure weights and buffers are on device
                 verify_module_on_device(b, self.device, f"block_{i}")
 
@@ -402,11 +417,22 @@ class ModelOffloader(Offloader):
         # After waiting, ensure the block is fully on device (all params and buffers)
         # This is important because swap_weight_devices might not move all buffers
         block = self.blocks[block_idx]
-        # Use weights_to_device to ensure all components are moved
+        
+        # Explicitly move ALL parameters to ensure nothing is missed
+        # This is critical for nested submodules like input_layernorm.weight
+        for param_name, param in block.named_parameters():
+            if param.device.type != self.device.type:
+                if 'lora' not in param_name:  # Skip LoRA params when moving to CPU
+                    param.data = param.data.to(self.device, non_blocking=True)
+        
+        # Use weights_to_device to ensure all components are moved (double-check)
         weights_to_device(block, self.device)
+        
         # Verify all components are on device (this will move any remaining components)
         verify_module_on_device(block, self.device, f"block_{block_idx}")
+        
         # Synchronize to ensure all moves are complete before forward pass
+        # This is critical to prevent device mismatch errors
         synchronize_device(self.device)
 
     def submit_move_blocks_forward(self, block_idx: int):
