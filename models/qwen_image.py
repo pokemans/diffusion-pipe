@@ -813,108 +813,76 @@ class QwenImagePipeline(BasePipeline):
         )
 
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
-        """
-        Generate sample images from text prompts using flow matching sampling.
-        Processes prompts sequentially to minimize VRAM usage.
-        
-        Args:
-            prompts: List of text prompts
-            num_inference_steps: Number of sampling steps
-            height: Image height in pixels
-            width: Image width in pixels
-            seed: Random seed for reproducibility
-            guidance_scale: Guidance scale (not used for Qwen Image, kept for API compatibility)
-            
-        Returns:
-            List of PIL Images
-        """
         images = []
         
-        # Ensure model is in evaluation mode
         self.transformer.eval()
         self.vae.eval()
 
+        # Qwen-Image typically uses a patch size of 2 for its transformer
+        patch_size = 2 
+        
         for prompt in prompts:
-            # 1. Prepare Generator for reproducibility
-            # We create a new generator per prompt to ensure seed consistency
             generator = torch.Generator(device=self.device).manual_seed(seed)
             
             with torch.no_grad():
-                # 2. Retrieve cached prompt embeddings or encode if not cached
-                # Check if cached embeddings exist and match this prompt
-                use_cached = False
-                if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
-                    hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
-                    # Check if current prompt matches a cached prompt
-                    if prompt in self.sample_prompts:
-                        cached_idx = self.sample_prompts.index(prompt)
-                        cached_embed = self.sample_prompt_embeds[cached_idx]
-                        # Use cached embedding, moving to correct device and dtype
-                        prompt_embeds = cached_embed.to(self.device, self.dtype)
-                        use_cached = True
+                # 1. Encode Text
+                # Note: For this model, ensure prompt_embeds includes the pooled info 
+                # or is the primary sequence input.
+                prompt_embeds, _ = self._encode_prompt(prompt)
                 
-                if not use_cached:
-                    # Fallback: encode prompt if not cached
-                    # Note: This should not happen if cache_sample_prompts was called properly
-                    raise RuntimeError(f'Prompt "{prompt}" not found in cached embeddings. Call cache_sample_prompts() before generate_samples().')
-                
-                # Qwen Image doesn't use pooled embeddings in the same way as SDXL
-                # Set to None or extract from cached embedding if needed
-                pooled_embeds = None
-
-                # 3. Prepare Latents (Noise)
-                # Qwen-Image typically uses 16 channels (similar to Flux/SD3) and 8x compression
+                # 2. Prepare Latents (4D: B, C, H, W)
                 in_channels = self.transformer.config.in_channels
                 latents = torch.randn(
                     (1, in_channels, height // 8, width // 8),
-                    generator=generator,
-                    device=self.device,
-                    dtype=self.dtype
+                    generator=generator, device=self.device, dtype=self.dtype
                 )
 
-                # 4. Flow Matching Scheduler (Euler Sampling)
-                # Time goes from 1.0 (noise) -> 0.0 (clean image)
+                # 3. Flatten latents for the Transformer
+                # Shape: [1, channels, h, w] -> [1, h*w, channels]
+                batch, channels, h, w = latents.shape
+                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1)
+                
+                # Prepare img_shapes for RoPE: [(h, w, 1)]
+                img_shapes = [(h, w, 1)]
+
+                # 4. Flow Matching Loop
                 timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
 
-                for i in tqdm(range(num_inference_steps), desc=f"Generating {prompt[:20]}..."):
+                for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
                     
-                    # Create timestep tensor for the model
-                    t_tensor = t_curr.unsqueeze(0) # Shape: [1]
+                    # Model expects timestep as a tensor
+                    t_tensor = (t_curr * 1000).expand(batch).to(self.device, dtype=torch.long)
 
-                    # Predict velocity field (v)
-                    # Note: Qwen Image does not use CFG (guidance_scale), so no double-batching needed
+                    # Predict
                     model_output = self.transformer(
-                        hidden_states=latents,
-                        timestep=t_tensor,
+                        hidden_states=latents_seq,
                         encoder_hidden_states=prompt_embeds,
-                        class_labels=pooled_embeds,
+                        timestep=t_tensor,
+                        img_shapes=img_shapes,
+                        guidance=torch.full((batch,), guidance_scale, device=self.device, dtype=self.dtype),
                         return_dict=False
                     )[0]
 
-                    # Euler Step: x_next = x_curr + (t_next - t_curr) * v
-                    # dt is negative because we are going from 1.0 to 0.0
+                    # Euler Step on the sequence
                     dt = t_next - t_curr
-                    latents = latents + model_output * dt
+                    latents_seq = latents_seq + model_output * dt
 
-                # 5. Decode Latents to Image
-                # Unscale latents according to VAE config
+                # 5. Unflatten Latents back to 4D for VAE
+                latents = latents_seq.permute(0, 2, 1).view(batch, channels, h, w)
+
+                # 6. Decode
                 latents = latents / self.vae.config.scaling_factor
-                
-                # VAE Decode
                 image = self.vae.decode(latents, return_dict=False)[0]
                 
-                # 6. Post-processing (Tensor -> PIL)
-                # Denormalize from [-1, 1] to [0, 1]
+                # 7. Post-process
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-                
-                # Convert to PIL
                 pil_image = Image.fromarray((image[0] * 255).astype("uint8"))
                 images.append(pil_image)
 
-        return images        
+        return images
 
     def to_layers(self):
         transformer = self.transformer
