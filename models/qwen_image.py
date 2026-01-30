@@ -819,8 +819,8 @@ class QwenImagePipeline(BasePipeline):
         if guidance_scale is None:
             guidance_scale = 1.0
             
-        self.transformer.eval()
-        self.vae.eval()
+        #self.transformer.eval()
+        #self.vae.eval()
 
         for prompt in prompts:
             # --- Cached Embedding Logic ---
