@@ -1107,10 +1107,16 @@ class DatasetManager:
         self.datasets = []
         # Check if text encoder block swapping is enabled
         self.text_encoder_offloaders = getattr(model, 'text_encoder_offloaders', None)
+        # Check if any offloader has debug enabled
+        debug_enabled = False
         if self.text_encoder_offloaders is not None:
-            print(f'[DEBUG] DatasetManager: text_encoder_offloaders = {self.text_encoder_offloaders}')
+            debug_enabled = any(offloader is not None and hasattr(offloader, 'debug') and offloader.debug 
+                               for offloader in self.text_encoder_offloaders)
+            if debug_enabled:
+                print(f'[DEBUG] DatasetManager: text_encoder_offloaders = {self.text_encoder_offloaders}')
         else:
-            print(f'[DEBUG] DatasetManager: text_encoder_offloaders is None')
+            if debug_enabled:
+                print(f'[DEBUG] DatasetManager: text_encoder_offloaders is None')
 
     def register(self, dataset):
         self.datasets.append(dataset)
@@ -1158,7 +1164,11 @@ class DatasetManager:
         # This ensures hooks are removed and text encoder is ready for training
         # IMPORTANT: This must happen BEFORE unloading models, so text encoder is on CUDA for training
         if self.text_encoder_offloaders is not None:
-            print('[DEBUG] Disabling text encoder block swapping after caching')
+            # Check if debug is enabled for any offloader
+            debug_enabled = any(offloader is not None and hasattr(offloader, 'debug') and offloader.debug 
+                               for offloader in self.text_encoder_offloaders)
+            if debug_enabled:
+                print('[DEBUG] Disabling text encoder block swapping after caching')
             if hasattr(self.model, 'disable_text_encoder_block_swap'):
                 self.model.disable_text_encoder_block_swap()
             else:
@@ -1217,14 +1227,23 @@ class DatasetManager:
                 empty_cuda_cache()
                 # If this is a text encoder and block swapping is enabled, handle it specially
                 if id > 0:
-                    print(f'[DEBUG] _handle_task: Processing text encoder (id={id}), text_encoder_offloaders={self.text_encoder_offloaders}')
+                    # Check if debug is enabled for any offloader
+                    debug_enabled = False
+                    if self.text_encoder_offloaders is not None:
+                        debug_enabled = any(offloader is not None and hasattr(offloader, 'debug') and offloader.debug 
+                                           for offloader in self.text_encoder_offloaders)
+                    
+                    if debug_enabled:
+                        print(f'[DEBUG] _handle_task: Processing text encoder (id={id}), text_encoder_offloaders={self.text_encoder_offloaders}')
                     if self.text_encoder_offloaders is not None:
                         text_encoder_idx = id - 1
-                        print(f'[DEBUG] _handle_task: text_encoder_idx={text_encoder_idx}, len(offloaders)={len(self.text_encoder_offloaders)}')
+                        if debug_enabled:
+                            print(f'[DEBUG] _handle_task: text_encoder_idx={text_encoder_idx}, len(offloaders)={len(self.text_encoder_offloaders)}')
                         if (text_encoder_idx < len(self.text_encoder_offloaders) and 
                             self.text_encoder_offloaders[text_encoder_idx] is not None):
                             offloader = self.text_encoder_offloaders[text_encoder_idx]
-                            print(f'[DEBUG] _handle_task: Using block swapping for text encoder {text_encoder_idx}')
+                            if debug_enabled:
+                                print(f'[DEBUG] _handle_task: Using block swapping for text encoder {text_encoder_idx}')
                             # For block swapping, prepare_block_devices_before_forward() sets up the initial state:
                             # - Blocks [0 : num_blocks - blocks_to_swap] are moved to CUDA
                             # - Blocks [num_blocks - blocks_to_swap :] are kept on CPU
@@ -1233,10 +1252,12 @@ class DatasetManager:
                             # breaking the block swapping mechanism.
                             offloader.prepare_block_devices_before_forward()
                         else:
-                            print(f'[DEBUG] _handle_task: Block swapping not available for text encoder {text_encoder_idx}, moving entire model to CUDA')
+                            if debug_enabled:
+                                print(f'[DEBUG] _handle_task: Block swapping not available for text encoder {text_encoder_idx}, moving entire model to CUDA')
                             self.submodels[id].to('cuda')
                     else:
-                        print(f'[DEBUG] _handle_task: text_encoder_offloaders is None, moving entire model to CUDA')
+                        if debug_enabled:
+                            print(f'[DEBUG] _handle_task: text_encoder_offloaders is None, moving entire model to CUDA')
                         self.submodels[id].to('cuda')
                 else:
                     self.submodels[id].to('cuda')
