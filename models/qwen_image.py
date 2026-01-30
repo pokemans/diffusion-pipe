@@ -922,6 +922,9 @@ class QwenImagePipeline(BasePipeline):
             elif isinstance(decoded, dict):
                 decoded = decoded['sample']
             
+            # Move decoded to CPU before processing
+            decoded = decoded.cpu().float()
+            
             # Move VAE back to CPU to free GPU memory before block swap restoration
             vae.to('cpu')
         finally:
@@ -932,16 +935,23 @@ class QwenImagePipeline(BasePipeline):
                 except Exception:
                     pass  # Ignore errors during cleanup
         
+        # Handle frame dimension in decoded tensor before indexing
+        # VAE output format: [B, C, F, H, W] where F=1 for single images
+        # Squeeze frame dimension if present (dimension 2, index 2)
+        if decoded.ndim == 5 and decoded.shape[2] == 1:
+            decoded = decoded.squeeze(2)  # [B, C, F, H, W] -> [B, C, H, W] when F=1
+        
         # Convert to PIL images
         images = []
         for i in range(len(prompts)):
-            img = decoded[i].cpu().float()
+            img = decoded[i]  # Already on CPU and float
             # VAE output is in range [-1, 1], convert to [0, 1]
             img = (img + 1) / 2
             img = img.clamp(0, 1)
-            # Squeeze frame dimension if present (for single images, F=1)
-            if img.ndim == 4 and img.shape[1] == 1:
-                img = img.squeeze(1)  # [C, F, H, W] -> [C, H, W] when F=1
+            # Ensure we have 3D tensor [C, H, W] for PIL conversion
+            if img.ndim != 3:
+                # If still not 3D (shouldn't happen after frame squeeze), try squeezing size-1 dims
+                img = img.squeeze()
             # Convert to PIL
             pil_img = torchvision.transforms.functional.to_pil_image(img)
             images.append(pil_img)
