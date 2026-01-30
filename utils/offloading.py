@@ -120,20 +120,59 @@ def weights_to_device(layer: nn.Module, device: torch.device):
     Move all weights and buffers in a layer to the specified device.
     This is more thorough than just calling .to() on the module when dealing with
     blocks that are part of a parent model structure.
+    Recursively handles all submodules and ensures all buffers are moved.
     """
     for name, module in layer.named_modules():
         if device.type == 'cpu' and 'lora' in name:
             continue
         # Move weights
         if hasattr(module, "weight") and module.weight is not None:
-            module.weight.data = module.weight.data.to(device, non_blocking=True)
+            if module.weight.device.type != device.type:
+                module.weight.data = module.weight.data.to(device, non_blocking=True)
         # Move biases
         if hasattr(module, "bias") and module.bias is not None:
-            module.bias.data = module.bias.data.to(device, non_blocking=True)
+            if module.bias.device.type != device.type:
+                module.bias.data = module.bias.data.to(device, non_blocking=True)
         # Move buffers (like LayerNorm's running_mean, running_var, or weight/bias in some cases)
+        # Use named_buffers(recurse=False) to get buffers directly on this module
         for buffer_name, buffer in module.named_buffers(recurse=False):
-            if buffer is not None:
+            if buffer is not None and buffer.device.type != device.type:
+                # Use register_buffer to properly update the buffer
                 module.register_buffer(buffer_name, buffer.to(device, non_blocking=True))
+        # Also check _buffers dict directly to catch any buffers not registered properly
+        for buffer_name in list(module._buffers.keys()):
+            buffer = module._buffers.get(buffer_name)
+            if buffer is not None and buffer.device.type != device.type:
+                module._buffers[buffer_name] = buffer.to(device, non_blocking=True)
+
+
+def verify_module_on_device(module: nn.Module, device: torch.device, module_name: str = "") -> bool:
+    """
+    Verify that all parameters and buffers in a module are on the specified device.
+    Returns True if all components are on device, False otherwise.
+    Also moves any components found on wrong device.
+    """
+    all_on_device = True
+    for name, submodule in module.named_modules():
+        full_name = f"{module_name}.{name}" if module_name else name
+        # Check parameters
+        for param_name, param in submodule.named_parameters(recurse=False):
+            if param.device.type != device.type:
+                if 'lora' not in full_name:  # Skip LoRA params when moving to CPU
+                    param.data = param.data.to(device, non_blocking=True)
+                    all_on_device = False
+        # Check buffers
+        for buffer_name, buffer in submodule.named_buffers(recurse=False):
+            if buffer is not None and buffer.device.type != device.type:
+                submodule.register_buffer(buffer_name, buffer.to(device, non_blocking=True))
+                all_on_device = False
+        # Also check _buffers dict
+        for buffer_name in list(submodule._buffers.keys()):
+            buffer = submodule._buffers.get(buffer_name)
+            if buffer is not None and buffer.device.type != device.type:
+                submodule._buffers[buffer_name] = buffer.to(device, non_blocking=True)
+                all_on_device = False
+    return all_on_device
 
 
 class Offloader:
@@ -275,6 +314,8 @@ class ModelOffloader(Offloader):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             for block in self.blocks:
                 block.to(self.device)
+                # Verify all components are on device
+                verify_module_on_device(block, self.device, f"block")
             return
 
         if self.debug:
@@ -313,6 +354,10 @@ class ModelOffloader(Offloader):
                             buffer.data = buffer.data.to(self.device, non_blocking=True)
                     # Then move the block structure itself (handles any edge cases)
                     b.to(self.device)
+                    # Use weights_to_device to ensure all nested components are moved
+                    weights_to_device(b, self.device)
+                    # Verify all components are on device
+                    verify_module_on_device(b, self.device, f"block_{i}")
                     if self.debug and i % 5 == 0:
                         print(f"[{self.block_type}] Moved block {i} to CUDA")
                 except torch.cuda.OutOfMemoryError as e:
@@ -323,21 +368,26 @@ class ModelOffloader(Offloader):
                     # Try moving weights/buffers first, then structure
                     weights_to_device(b, self.device)
                     b.to(self.device)
+                    verify_module_on_device(b, self.device, f"block_{i}")
             else:
                 b.to(self.device)
                 weights_to_device(b, self.device)  # make sure weights and buffers are on device
+                verify_module_on_device(b, self.device, f"block_{i}")
 
         # Handle blocks that should be swapped (kept on CPU)
         # These blocks should NOT be moved to CUDA at all
         blocks_to_swap = self.blocks[self.num_blocks - self.blocks_to_swap :]
-        for b in blocks_to_swap:
+        for i, b in enumerate(blocks_to_swap):
+            block_idx = self.num_blocks - self.blocks_to_swap + i
             if blocks_on_cpu:
                 # Blocks are already on CPU, ensure all weights are on CPU
                 weights_to_device(b, torch.device('cpu'))
+                verify_module_on_device(b, torch.device('cpu'), f"block_{block_idx}")
             else:
                 # Blocks are on CUDA, move structure to CPU first, then ensure weights are on CPU
                 b.to(torch.device('cpu'))
                 weights_to_device(b, torch.device('cpu'))
+                verify_module_on_device(b, torch.device('cpu'), f"block_{block_idx}")
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
@@ -352,14 +402,12 @@ class ModelOffloader(Offloader):
         # After waiting, ensure the block is fully on device (all params and buffers)
         # This is important because swap_weight_devices might not move all buffers
         block = self.blocks[block_idx]
-        # Ensure all parameters are on device
-        for param in block.parameters():
-            if param.device.type != self.device.type:
-                param.data = param.data.to(self.device, non_blocking=True)
-        # Ensure all buffers are on device
-        for buffer in block.buffers():
-            if buffer.device.type != self.device.type:
-                buffer.data = buffer.data.to(self.device, non_blocking=True)
+        # Use weights_to_device to ensure all components are moved
+        weights_to_device(block, self.device)
+        # Verify all components are on device (this will move any remaining components)
+        verify_module_on_device(block, self.device, f"block_{block_idx}")
+        # Synchronize to ensure all moves are complete before forward pass
+        synchronize_device(self.device)
 
     def submit_move_blocks_forward(self, block_idx: int):
         # check if blocks_to_swap is enabled

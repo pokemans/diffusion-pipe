@@ -1227,8 +1227,8 @@ class DatasetManager:
                             print(f'[DEBUG] _handle_task: Using block swapping for text encoder {text_encoder_idx}')
                             # For block swapping, prepare_block_devices_before_forward() moves blocks individually
                             # to CUDA, then moves weights of swapped blocks back to CPU. This avoids OOM from
-                            # moving the entire model at once. The blocks are moved individually, so the parent
-                            # model structure doesn't need to be fully on CUDA first.
+                            # moving the entire model at once. The improved implementation ensures all
+                            # submodules and buffers are properly moved to the correct device.
                             offloader.prepare_block_devices_before_forward()
                         else:
                             print(f'[DEBUG] _handle_task: Block swapping not available for text encoder {text_encoder_idx}, moving entire model to CUDA')
