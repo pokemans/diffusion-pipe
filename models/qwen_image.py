@@ -863,22 +863,28 @@ class QwenImagePipeline(BasePipeline):
                 # timesteps 1.0 -> 0.0
                 timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=transformer_device, dtype=transformer_dtype)
 
-                for i in tqdm(range(num_inference_steps), desc=f"Generating"):
+                for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
                     
-                    # Convert t to tensor on transformer's device
-                    t_tensor = t_curr.expand(batch).to(transformer_device, dtype=transformer_dtype)
+                    # Qwen-Image FM usually expects 0-1000 float
+                    t_tensor = (t_curr * 1000).expand(batch).to(transformer_device, dtype=transformer_dtype)
+
+                    # Use Keywords for everything
+                    kwargs = {
+                        "hidden_states": latents_seq,
+                        "encoder_hidden_states": prompt_embeds,
+                        "timestep": t_tensor,
+                        "img_shapes": img_shapes,
+                        "return_dict": False
+                    }
                     
-                    # --- THE TRANSFORMER CALL ---
-                    model_output = self.transformer(
-                        hidden_states=latents_seq,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=t_tensor,
-                        img_shapes=img_shapes,
-                        guidance=torch.full((batch,), guidance_val, device=transformer_device, dtype=transformer_dtype),
-                        return_dict=False
-                    )[0]
+                    # Only add guidance if provided/supported
+                    if guidance_val is not None:
+                        kwargs["guidance"] = torch.full((batch,), guidance_val, device=transformer_device, dtype=transformer_dtype)
+
+                    model_output = self.transformer(**kwargs)[0]
+
                     # Euler Step
                     dt = t_next - t_curr
                     latents_seq = latents_seq + model_output * dt
