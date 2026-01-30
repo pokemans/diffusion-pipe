@@ -812,7 +812,7 @@ class QwenImagePipeline(BasePipeline):
         )
 
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
-        """
+"""
         Generate sample images from text prompts using flow matching sampling.
         Processes prompts sequentially to minimize VRAM usage.
         
@@ -827,234 +827,76 @@ class QwenImagePipeline(BasePipeline):
         Returns:
             List of PIL Images
         """
-        import torchvision
-        import numpy as np
-        
-        # Baseline VRAM measurement
-        vram_allocated = self._log_vram_usage("Function start (baseline)")
-        
-        # Get device and dtype
-        device = next(self.transformer.parameters()).device
-        dtype = self.model_config['dtype']
-        
-        # Check if accessing transformer triggers loading
-        vram_allocated = self._log_vram_usage("After accessing transformer", vram_allocated)
-        
-        # Round height/width to multiple of pixels_round_to_multiple (32)
-        height = ((height + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
-        width = ((width + self.pixels_round_to_multiple - 1) // self.pixels_round_to_multiple) * self.pixels_round_to_multiple
-
-        print(f'Generating samples for {len(prompts)} prompt(s) with height {height} and width {width}')
-        
-        # Calculate latent dimensions (packing reduces spatial dims by 2)
-        latent_h = height // 2
-        latent_w = width // 2
-        
-        # Get num_channels_latents from transformer config
-        num_channels_latents = self.transformer.config.in_channels // 4
-        
-        # Prepare for inference (once, reused for all prompts)
-        #self.transformer.eval()
-        # self.prepare_block_swap_inference(disable_block_swap=False)
-        
-        # Pre-compute constants
-        num_frames = 1  # For images
-        expected_img_seq_len = (latent_h // 2) * (latent_w // 2) * num_frames
-        dt = 1.0 / num_inference_steps
-        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
-    
-        
         images = []
         
-        # Process each prompt sequentially
-        for prompt_idx, prompt in enumerate(prompts):
-            print(f'Processing prompt {prompt_idx + 1}/{len(prompts)}: {prompt}')
-            
-            # Set random seed for this prompt (seed + prompt_idx for different results)
-            current_seed = seed + prompt_idx
-            torch.manual_seed(current_seed)
-            np.random.seed(current_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(current_seed)
-            
-            # Check if cached embeddings exist and match this prompt
-            use_cached = False
-            if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
-                hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
-                # Check if current prompt matches a cached prompt
-                if prompt in self.sample_prompts:
-                    cached_idx = self.sample_prompts.index(prompt)
-                    cached_embed = self.sample_prompt_embeds[cached_idx]
-                    # Use cached embedding, moving to correct device and dtype
-                    prompt_embeds_single = cached_embed.to(device, dtype)
-                    use_cached = True
-                    print(f'Using cached embedding for prompt {prompt_idx + 1}')
-                    vram_allocated = self._log_vram_usage(f"After moving cached embedding to device (prompt {prompt_idx + 1})", vram_allocated)
-            
-            # If not using cached embedding, compute new one
-            if not use_cached:
-                print(f'Computing new embedding for prompt {prompt_idx + 1}')
-                # Ensure text encoder is on the correct device before encoding
-                # Check if text encoder block swapping is enabled
-                use_block_swap = (self.text_encoder_offloader is not None and 
-                                 self.text_encoder_offloader.blocks_to_swap is not None and 
-                                 self.text_encoder_offloader.blocks_to_swap > 0)
-                
-                if use_block_swap:
-                    # Block swapping handles device movement
-                    self.prepare_text_encoder_block_swap_inference(disable_block_swap=False)
-                else:
-                    # Ensure text encoder is on the correct device
-                    # Check where the embedding layer is
-                    text_encoder = self.text_encoder
-                    if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
-                        language_model = text_encoder.model.language_model
-                        if hasattr(language_model, 'model') and hasattr(language_model.model, 'embed_tokens'):
-                            # Check if embedding layer is on wrong device
-                            embed_device = next(language_model.model.embed_tokens.parameters()).device
-                            if embed_device != device:
-                                # Move text encoder to device
-                                # Extract layers temporarily to move structure
-                                if hasattr(language_model.model, 'layers'):
-                                    layers = language_model.model.layers
-                                    language_model.model.layers = None
-                                    try:
-                                        text_encoder.to(device)
-                                        vram_allocated = self._log_vram_usage(f"After moving text encoder to device (prompt {prompt_idx + 1})", vram_allocated)
-                                    except NotImplementedError as e:
-                                        if "meta tensor" in str(e):
-                                            self._move_meta_tensors_to_device(text_encoder, device)
-                                            vram_allocated = self._log_vram_usage(f"After moving text encoder meta tensors (prompt {prompt_idx + 1})", vram_allocated)
-                                        else:
-                                            raise
-                                    finally:
-                                        language_model.model.layers = layers
-                                else:
-                                    try:
-                                        text_encoder.to(device)
-                                        vram_allocated = self._log_vram_usage(f"After moving text encoder to device (fallback, prompt {prompt_idx + 1})", vram_allocated)
-                                    except NotImplementedError as e:
-                                        if "meta tensor" in str(e):
-                                            self._move_meta_tensors_to_device(text_encoder, device)
-                                            vram_allocated = self._log_vram_usage(f"After moving text encoder meta tensors (fallback, prompt {prompt_idx + 1})", vram_allocated)
-                                        else:
-                                            raise
-                
-                # Encode single prompt
-                prompt_embeds_list = self._get_qwen_prompt_embeds(
-                    [prompt],
-                    control_files=None,
-                    device=device
-                )
-                prompt_embeds_single = prompt_embeds_list[0]  # Single prompt, no padding needed
-                prompt_embeds_single = prompt_embeds_single.to(device, dtype)
-                vram_allocated = self._log_vram_usage(f"After computing new embedding (prompt {prompt_idx + 1})", vram_allocated)
-            
-            # Create attention mask for single prompt
-            max_text_len = prompt_embeds_single.size(0)
-            prompt_embeds_mask_single = torch.ones(max_text_len, dtype=torch.bool, device=device)
-            
-            # Reshape prompt_embeds for model input: add batch dimension
-            # Initialize prompt_embeds before loop to avoid UnboundLocalError (Python sees del later)
-            prompt_embeds = prompt_embeds_single.unsqueeze(0)  # (1, seq_len, hidden_dim)
-            prompt_embeds_mask = prompt_embeds_mask_single.unsqueeze(0)  # (1, seq_len)
-            
-            # Initialize latents with random noise (batch size = 1)
-            x_t = torch.randn(1, num_channels_latents, num_frames, latent_h, latent_w, device=device, dtype=dtype)
-            vram_allocated = self._log_vram_usage(f"After creating latents tensor (prompt {prompt_idx + 1})", vram_allocated)
-            
-            # Create attention mask for single prompt (batch size = 1)
-            img_attention_mask = torch.ones((1, expected_img_seq_len), dtype=torch.bool, device=device)
-            attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1)
-            attention_mask = attention_mask.view(1, 1, 1, -1)
-            
-            # Flow matching sampling: Euler steps from t=1.0 to t=0.0
-            with torch.no_grad():
-                print(f'Starting sampling loop')
-                for i in range(num_inference_steps):
-                    t = timesteps[i]
-                    
-                    # Pack current state for model input: (1, c, f, h, w) -> (1, seq_len, hidden_dim)
-                    x_t_packed = self._pack_latents(x_t, 1, num_channels_latents, latent_h, latent_w)
-                    
-                    # Prepare img_shapes and txt_seq_lens (batch size = 1)
-                    img_shapes = torch.tensor([[(1, latent_h // 2, latent_w // 2)]], dtype=torch.int32, device=device)
-                    txt_seq_lens = torch.tensor([max_text_len], dtype=torch.int32, device=device)
-                    
-                    # Transform t according to model config
-                    t_for_model = t.expand(1).to(dtype)
-                    timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
-                    
-                    if shift := self.model_config.get('shift', None):
-                        t_for_model = (t_for_model * shift) / (1 + (shift - 1) * t_for_model)
-                    elif self.model_config.get('flux_shift', False):
-                        mu = get_lin_function(y1=0.5, y2=1.15)((latent_h // 2) * (latent_w // 2))
-                        t_for_model = time_shift(mu, 1.0, t_for_model)
-                    
-                    # Forward through layers
-                    model_inputs = (x_t_packed, prompt_embeds, attention_mask, t_for_model, img_shapes, txt_seq_lens)
-                    vram_allocated = self._log_vram_usage(f"Before to_layers() call (step {i+1}/{num_inference_steps}, prompt {prompt_idx + 1})", vram_allocated)
-                    layers = self.to_layers()
-                    vram_allocated = self._log_vram_usage(f"After to_layers() call (step {i+1}/{num_inference_steps}, prompt {prompt_idx + 1})", vram_allocated)
-                    predicted_target_packed = model_inputs
-                    for layer in layers:
-                        predicted_target_packed = layer(predicted_target_packed)
-                                        
-                    # Unpack predicted target: (1, seq_len, hidden_dim) -> (1, c, f, h, w)
-                    predicted_target = self._unpack_latents(predicted_target_packed, 1, num_channels_latents, latent_h, latent_w)
-                    # Flow matching ODE: dx/dt = v_t(x) where v_t(x_t) = x_0 - x_1
-                    # For Euler step going backwards in time (t decreases): x_{t-dt} = x_t - dt * v_t(x_t)
-                    # Since predicted_target = x_0 - x_1 = v_t(x_t), we update:
-                    x_t = x_t - dt * predicted_target
-                    
-                    # Log after first sampling step
-                    if i == 0:
-                        vram_allocated = self._log_vram_usage(f"After first sampling step (prompt {prompt_idx + 1})", vram_allocated)
-            
-            # After sampling, x_t should be close to x_1 (clean latents)
-            latents = x_t      
-            mean_tensor = self.vae.latents_mean_tensor.squeeze(2)  # (1, z_dim, 1, 1)
-            std_tensor = self.vae.latents_std_tensor.squeeze(2)  # (1, z_dim, 1, 1)
+        # Ensure model is in evaluation mode
+        self.transformer.eval()
+        self.vae.eval()
 
-            latents_for_vae = latents.squeeze(2)  # Remove frame dimension: (1, c, h, w)
-            latents_for_vae = latents_for_vae * std_tensor + mean_tensor
-            vram_allocated = self._log_vram_usage(f"Before VAE decode (prompt {prompt_idx + 1})", vram_allocated)
-            # Handle meta tensors before moving to device
-            vram_allocated = self._log_vram_usage(f"After moving VAE to device (prompt {prompt_idx + 1})", vram_allocated)
+        for prompt in prompts:
+            # 1. Prepare Generator for reproducibility
+            # We create a new generator per prompt to ensure seed consistency
+            generator = torch.Generator(device=self.device).manual_seed(seed)
             
             with torch.no_grad():
-                print(f'decoding with vae')
-                decoded = self.vae.decode(latents_for_vae.to(self.vae.device, self.vae.dtype))
-                vram_allocated = self._log_vram_usage(f"After VAE decode (prompt {prompt_idx + 1})", vram_allocated)
+                # 2. Encode Text Prompt
+                # Assuming self._encode_prompt handles the Qwen2.5-VL encoding logic
+                # Returns: prompt_embeds (hidden states), pooled_embeds (pooled vector)
+                prompt_embeds, pooled_embeds = self._encode_prompt(prompt)
+
+                # 3. Prepare Latents (Noise)
+                # Qwen-Image typically uses 16 channels (similar to Flux/SD3) and 8x compression
+                in_channels = self.transformer.config.in_channels
+                latents = torch.randn(
+                    (1, in_channels, height // 8, width // 8),
+                    generator=generator,
+                    device=self.device,
+                    dtype=self.dtype
+                )
+
+                # 4. Flow Matching Scheduler (Euler Sampling)
+                # Time goes from 1.0 (noise) -> 0.0 (clean image)
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+
+                for i in tqdm(range(num_inference_steps), desc=f"Generating {prompt[:20]}..."):
+                    t_curr = timesteps[i]
+                    t_next = timesteps[i + 1]
+                    
+                    # Create timestep tensor for the model
+                    t_tensor = t_curr.unsqueeze(0) # Shape: [1]
+
+                    # Predict velocity field (v)
+                    # Note: Qwen Image does not use CFG (guidance_scale), so no double-batching needed
+                    model_output = self.transformer(
+                        hidden_states=latents,
+                        timestep=t_tensor,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_embeds,
+                        return_dict=False
+                    )[0]
+
+                    # Euler Step: x_next = x_curr + (t_next - t_curr) * v
+                    # dt is negative because we are going from 1.0 to 0.0
+                    dt = t_next - t_curr
+                    latents = latents + model_output * dt
+
+                # 5. Decode Latents to Image
+                # Unscale latents according to VAE config
+                latents = latents / self.vae.config.scaling_factor
                 
-                if hasattr(decoded, 'sample'):
-                    decoded = decoded.sample
-                elif isinstance(decoded, dict):
-                    decoded = decoded['sample']
+                # VAE Decode
+                image = self.vae.decode(latents, return_dict=False)[0]
                 
-                vram_allocated = self._log_vram_usage(f"After moving VAE to CPU (prompt {prompt_idx + 1})", vram_allocated)
+                # 6. Post-processing (Tensor -> PIL)
+                # Denormalize from [-1, 1] to [0, 1]
+                image = (image / 2 + 0.5).clamp(0, 1)
+                image = image.cpu().permute(0, 2, 3, 1).float().numpy()
                 
-                # Ensure format is (B, C, H, W)
-                if decoded.dim() == 4 and decoded.shape[-1] == 3:
-                    decoded = decoded.movedim(-1, 1)
-                
-                # Convert to PIL image (single image, batch size = 1)
-                img = decoded[0].cpu().float()
-                # VAE output is typically in range [-1, 1], convert to [0, 1]
-                img = (img + 1) / 2
-                img = img.clamp(0, 1)
                 # Convert to PIL
-                pil_img = torchvision.transforms.functional.to_pil_image(img)
-                images.append(pil_img)
-                          
-        
-        # Clear CUDA cache after all prompts are processed
-        # Note: VAE device cleanup is handled by train.py's finally block
-        vram_allocated = self._log_vram_usage("Function end (before cache clear)", vram_allocated)
-        torch.cuda.empty_cache()
-        vram_allocated = self._log_vram_usage("Function end (after cache clear)", vram_allocated)
-        
-        return images
+                pil_image = Image.fromarray((image[0] * 255).astype("uint8"))
+                images.append(pil_image)
+
+        return images        
         
     def to_layers(self):
         transformer = self.transformer
