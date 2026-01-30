@@ -822,14 +822,28 @@ class QwenImagePipeline(BasePipeline):
         patch_size = 2 
         
         for prompt in prompts:
+            use_cached = False
+            if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
+                hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
+                # Check if current prompt matches a cached prompt
+                if prompt in self.sample_prompts:
+                    cached_idx = self.sample_prompts.index(prompt)
+                    cached_embed = self.sample_prompt_embeds[cached_idx]
+                    # Use cached embedding, moving to correct device and dtype
+                    prompt_embeds = cached_embed.to(self.device, self.dtype)
+                    use_cached = True
+                
+            if not use_cached:
+                # Fallback: encode prompt if not cached
+                # Note: This should not happen if cache_sample_prompts was called properly
+                raise RuntimeError(f'Prompt "{prompt}" not found in cached embeddings. Call cache_sample_prompts() before generate_samples().')
+                
+            # Qwen Image doesn't use pooled embeddings in the same way as SDXL
+            # Set to None or extract from cached embedding if needed
+            pooled_embeds = None
             generator = torch.Generator(device=self.device).manual_seed(seed)
             
-            with torch.no_grad():
-                # 1. Encode Text
-                # Note: For this model, ensure prompt_embeds includes the pooled info 
-                # or is the primary sequence input.
-                prompt_embeds, _ = self._encode_prompt(prompt)
-                
+            with torch.no_grad():                
                 # 2. Prepare Latents (4D: B, C, H, W)
                 in_channels = self.transformer.config.in_channels
                 latents = torch.randn(
