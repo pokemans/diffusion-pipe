@@ -854,14 +854,71 @@ class QwenImagePipeline(BasePipeline):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(current_seed)
             
-            # Encode single prompt
-            prompt_embeds_list = self._get_qwen_prompt_embeds(
-                [prompt],
-                control_files=None,
-                device=device
-            )
-            prompt_embeds_single = prompt_embeds_list[0]  # Single prompt, no padding needed
-            prompt_embeds_single = prompt_embeds_single.to(device, dtype)
+            # Check if cached embeddings exist and match this prompt
+            use_cached = False
+            if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
+                hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
+                # Check if current prompt matches a cached prompt
+                if prompt in self.sample_prompts:
+                    cached_idx = self.sample_prompts.index(prompt)
+                    cached_embed = self.sample_prompt_embeds[cached_idx]
+                    # Use cached embedding, moving to correct device and dtype
+                    prompt_embeds_single = cached_embed.to(device, dtype)
+                    use_cached = True
+                    print(f'Using cached embedding for prompt {prompt_idx + 1}')
+            
+            # If not using cached embedding, compute new one
+            if not use_cached:
+                # Ensure text encoder is on the correct device before encoding
+                # Check if text encoder block swapping is enabled
+                use_block_swap = (self.text_encoder_offloader is not None and 
+                                 self.text_encoder_offloader.blocks_to_swap is not None and 
+                                 self.text_encoder_offloader.blocks_to_swap > 0)
+                
+                if use_block_swap:
+                    # Block swapping handles device movement
+                    self.prepare_text_encoder_block_swap_inference(disable_block_swap=False)
+                else:
+                    # Ensure text encoder is on the correct device
+                    # Check where the embedding layer is
+                    text_encoder = self.text_encoder
+                    if hasattr(text_encoder, 'model') and hasattr(text_encoder.model, 'language_model'):
+                        language_model = text_encoder.model.language_model
+                        if hasattr(language_model, 'model') and hasattr(language_model.model, 'embed_tokens'):
+                            # Check if embedding layer is on wrong device
+                            embed_device = next(language_model.model.embed_tokens.parameters()).device
+                            if embed_device != device:
+                                # Move text encoder to device
+                                # Extract layers temporarily to move structure
+                                if hasattr(language_model.model, 'layers'):
+                                    layers = language_model.model.layers
+                                    language_model.model.layers = None
+                                    try:
+                                        text_encoder.to(device)
+                                    except NotImplementedError as e:
+                                        if "meta tensor" in str(e):
+                                            self._move_meta_tensors_to_device(text_encoder, device)
+                                        else:
+                                            raise
+                                    finally:
+                                        language_model.model.layers = layers
+                                else:
+                                    try:
+                                        text_encoder.to(device)
+                                    except NotImplementedError as e:
+                                        if "meta tensor" in str(e):
+                                            self._move_meta_tensors_to_device(text_encoder, device)
+                                        else:
+                                            raise
+                
+                # Encode single prompt
+                prompt_embeds_list = self._get_qwen_prompt_embeds(
+                    [prompt],
+                    control_files=None,
+                    device=device
+                )
+                prompt_embeds_single = prompt_embeds_list[0]  # Single prompt, no padding needed
+                prompt_embeds_single = prompt_embeds_single.to(device, dtype)
             
             # Create attention mask for single prompt
             max_text_len = prompt_embeds_single.size(0)
