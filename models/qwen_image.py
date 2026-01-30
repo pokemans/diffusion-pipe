@@ -66,7 +66,9 @@ def apply_rotary_emb_qwen(
         return out
     else:
         x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
+        # Slice freqs_cis to match x's sequence length (text and image have different S)
+        seq_len = x.size(1)
+        freqs_cis = freqs_cis[:seq_len].unsqueeze(1)
         x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
 
         return x_out.type_as(x)
