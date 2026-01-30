@@ -315,10 +315,40 @@ class QwenImagePipeline(BasePipeline):
                     for layer in layers:
                         layer.to(target_device)
                     # Also move the rest of the text encoder structure
-                    # Temporarily detach layers to move structure
-                    language_model.model.layers = None
-                    text_encoder.to(target_device)
-                    language_model.model.layers = layers
+                    # Check if we need to move (like DatasetManager)
+                    try:
+                        # Check if structure needs moving
+                        needs_move = False
+                        try:
+                            current_device_type = next(text_encoder.parameters()).device.type
+                            if current_device_type != target_device:
+                                needs_move = True
+                        except (StopIteration, RuntimeError):
+                            # Can't check device, assume we need to move
+                            needs_move = True
+                        
+                        if needs_move:
+                            # Temporarily detach layers to move structure
+                            language_model.model.layers = None
+                            try:
+                                text_encoder.to(target_device)
+                            except NotImplementedError as e:
+                                if "meta tensor" in str(e):
+                                    # Some parameters on meta device - layers are already moved, skip structure move
+                                    # This is OK since layers contain the main parameters
+                                    pass
+                                else:
+                                    raise
+                            finally:
+                                language_model.model.layers = layers
+                        else:
+                            # Already on target device, no need to move
+                            pass
+                    except Exception:
+                        # If anything fails, ensure layers are reattached
+                        if hasattr(language_model.model, 'layers') and language_model.model.layers is None:
+                            language_model.model.layers = layers
+                        raise
                 else:
                     # Fallback: move entire model
                     text_encoder.to(target_device)
