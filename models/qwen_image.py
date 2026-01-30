@@ -1018,26 +1018,13 @@ class QwenImagePipeline(BasePipeline):
 
             latents_for_vae = latents.squeeze(2)  # Remove frame dimension: (1, c, h, w)
             latents_for_vae = latents_for_vae * std_tensor + mean_tensor
-            
-            # Decode with VAE - diffusers VAE expects (B, C, H, W)
-            vae = self.get_vae()
             vram_allocated = self._log_vram_usage(f"Before VAE decode (prompt {prompt_idx + 1})", vram_allocated)
             # Handle meta tensors before moving to device
-            try:
-                vae.to(device)
-            except NotImplementedError as e:
-                if "meta tensor" in str(e):
-                    # Some parameters/buffers on meta device - manually move them
-                    self._move_meta_tensors_to_device(vae, device)
-                    # Try again after moving meta tensors
-                    vae.to(device)
-                else:
-                    raise
             vram_allocated = self._log_vram_usage(f"After moving VAE to device (prompt {prompt_idx + 1})", vram_allocated)
             
             with torch.no_grad():
                 print(f'decoding with vae')
-                decoded = vae.decode(latents_for_vae.to(vae.device, vae.dtype))
+                decoded = self.vae.decode(latents_for_vae.to(self.vae.device, self.vae.dtype))
                 vram_allocated = self._log_vram_usage(f"After VAE decode (prompt {prompt_idx + 1})", vram_allocated)
                 
                 if hasattr(decoded, 'sample'):
@@ -1045,8 +1032,6 @@ class QwenImagePipeline(BasePipeline):
                 elif isinstance(decoded, dict):
                     decoded = decoded['sample']
                 
-                # Move VAE back to CPU to free GPU memory before block swap restoration
-                vae.to('cpu')
                 vram_allocated = self._log_vram_usage(f"After moving VAE to CPU (prompt {prompt_idx + 1})", vram_allocated)
                 
                 # Ensure format is (B, C, H, W)
