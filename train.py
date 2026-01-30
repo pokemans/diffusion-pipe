@@ -888,6 +888,20 @@ if __name__ == '__main__':
             T_mult=config.get('lr_scheduler_t_mult', 1),
             eta_min=config.get('lr_scheduler_eta_min', 0)
         )
+    elif scheduler_type == 'onecycle':
+        if config['warmup_steps'] > 0:
+            print(f'cannot use warmup_steps with onecycle scheduler')
+            exit()
+        if not 'lr_max_onecycle' in optimizer.param_groups[0]:
+            print(f'lr_max_onecycle needs to be set - lr is initial lr, lr_max_onecycle is max lr')
+            exit()
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=optimizer.param_groups[0]['lr_max_onecycle'],
+            total_steps=config['epochs'] * steps_per_epoch,
+            pct_start=config.get('lr_scheduler_pct_start', 0.3),
+            anneal_strategy=config.get('lr_scheduler_anneal_strategy', 'cos'),
+        )
     else:
         raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
     if config['warmup_steps'] > 0:
