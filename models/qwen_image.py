@@ -352,15 +352,19 @@ class QwenImagePipeline(BasePipeline):
         try:
             for i, layer in enumerate(layers):
                 def make_hook(layer_idx, offloader_ref):
-                    def forward_pre_hook(module, input):
-                        # Wait for this block to be on GPU before forward
+                def forward_pre_hook(module, input):
+                    # Only do block swapping if it's enabled (during caching)
+                    # During training, block swapping should be disabled
+                    if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
                         offloader_ref.wait_for_block(layer_idx)
-                        return None
-                    
-                    def forward_hook(module, input, output):
-                        # Submit move for this block after forward (move to CPU, next to GPU)
+                    return None
+                
+                def forward_hook(module, input, output):
+                    # Only do block swapping if it's enabled (during caching)
+                    # During training, block swapping should be disabled
+                    if offloader_ref.blocks_to_swap is not None and offloader_ref.blocks_to_swap > 0:
                         offloader_ref.submit_move_blocks_forward(layer_idx)
-                        return output
+                    return output
                     
                     return forward_pre_hook, forward_hook
                 
@@ -403,6 +407,27 @@ class QwenImagePipeline(BasePipeline):
                 handle_pre.remove()
                 handle_post.remove()
             self._text_encoder_hooks = []
+    
+    def disable_text_encoder_block_swap(self):
+        """
+        Disable text encoder block swapping and ensure text encoder is fully on CUDA.
+        This should be called after caching is complete.
+        """
+        # Remove hooks first
+        self._remove_text_encoder_hooks()
+        
+        # Disable block swapping in offloaders
+        if hasattr(self, 'text_encoder_offloaders') and self.text_encoder_offloaders is not None:
+            for offloader in self.text_encoder_offloaders:
+                if offloader is not None:
+                    offloader.disable_block_swap()
+                    # Move all blocks to CUDA to ensure text encoder is fully available for training
+                    from utils.offloading import weights_to_device
+                    for block in offloader.blocks:
+                        block.to('cuda')
+                        weights_to_device(block, torch.device('cuda'))
+        
+        print('[DEBUG] Text encoder block swapping disabled, text encoder moved to CUDA')
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)

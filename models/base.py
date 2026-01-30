@@ -260,7 +260,26 @@ class BasePipeline:
             if offloader is not None:
                 offloader.enable_block_swap()
                 offloader.set_forward_only(True)
-                offloader.prepare_block_devices_before_forward()
+                # Don't call prepare_block_devices_before_forward() here - it will be called
+                # in DatasetManager when the text encoder is actually needed
+    
+    def disable_text_encoder_block_swap(self):
+        """
+        Disable text encoder block swapping and ensure text encoder is fully on CUDA.
+        This should be called after caching is complete.
+        """
+        # Disable block swapping in offloaders
+        if hasattr(self, 'text_encoder_offloaders') and self.text_encoder_offloaders is not None:
+            for offloader in self.text_encoder_offloaders:
+                if offloader is not None:
+                    offloader.disable_block_swap()
+                    # Move all blocks to CUDA to ensure text encoder is fully available for training
+                    for block in offloader.blocks:
+                        block.to('cuda')
+                        from utils.offloading import weights_to_device
+                        weights_to_device(block, torch.device('cuda'))
+        
+        print('[DEBUG] Text encoder block swapping disabled, text encoder moved to CUDA')
 
     def configure_adapter(self, adapter_config):
         target_linear_modules = set()

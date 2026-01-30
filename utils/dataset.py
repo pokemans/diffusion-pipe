@@ -1154,21 +1154,33 @@ class DatasetManager:
                 break
             self._handle_task(task)
 
-        if unload_models:
-            # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
-            # TODO: check if this is actually freeing memory.
-            # Clean up text encoder block swapping if enabled
-            if self.text_encoder_offloaders is not None:
-                # Remove hooks first (Qwen-specific)
+        # Disable text encoder block swapping after caching (before unloading models)
+        # This ensures hooks are removed and text encoder is ready for training
+        # IMPORTANT: This must happen BEFORE unloading models, so text encoder is on CUDA for training
+        if self.text_encoder_offloaders is not None:
+            print('[DEBUG] Disabling text encoder block swapping after caching')
+            if hasattr(self.model, 'disable_text_encoder_block_swap'):
+                self.model.disable_text_encoder_block_swap()
+            else:
+                # Fallback: manual cleanup
                 if hasattr(self.model, '_remove_text_encoder_hooks'):
                     self.model._remove_text_encoder_hooks()
                 for i, offloader in enumerate(self.text_encoder_offloaders):
                     if offloader is not None:
-                        # Ensure all blocks are moved to CPU
                         offloader.disable_block_swap()
-                        # Move all blocks to CPU explicitly
+                        # Move all blocks to CUDA for training (not CPU, since we need it for training)
                         for block in offloader.blocks:
-                            block.to('cpu')
+                            block.to('cuda')
+                            from utils.offloading import weights_to_device
+                            weights_to_device(block, torch.device('cuda'))
+            # Also ensure the entire text encoder model is on CUDA
+            for text_encoder in self.text_encoders:
+                if isinstance(text_encoder, nn.Module):
+                    text_encoder.to('cuda')
+        
+        if unload_models:
+            # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
+            # TODO: check if this is actually freeing memory.
             for model in self.submodels:
                 if not isinstance(model, nn.Module):
                     continue
