@@ -827,12 +827,11 @@ class QwenImagePipeline(BasePipeline):
         # Prepare for inference (once, reused for all prompts)
         self.transformer.eval()
         self.prepare_block_swap_inference(disable_block_swap=False)
-        
-        # Prepare VAE (once, reused for all prompts)
+
         vae = self.get_vae()
         vae.eval()
-        vae.to(device)
-        
+        self._move_meta_tensors_to_device(vae, 'cpu')
+        vae.to('cpu')
         print(f'VAE is prepared')
         
         # Pre-compute constants
@@ -840,10 +839,7 @@ class QwenImagePipeline(BasePipeline):
         expected_img_seq_len = (latent_h // 2) * (latent_w // 2) * num_frames
         dt = 1.0 / num_inference_steps
         timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
-        
-        # Mean and std tensors for VAE normalization (reused for all prompts)
-        mean_tensor = self.vae.latents_mean_tensor.squeeze(2)  # (1, z_dim, 1, 1)
-        std_tensor = self.vae.latents_std_tensor.squeeze(2)  # (1, z_dim, 1, 1)
+    
         
         images = []
         
@@ -933,10 +929,16 @@ class QwenImagePipeline(BasePipeline):
             
             # After sampling, x_t should be close to x_1 (clean latents)
             latents = x_t
+            # Prepare VAE for decoding (lazy load - only when needed)
+            # Load once on first use, then reuse for subsequent prompts
+            # Handle meta tensors before moving to device
+            self._move_meta_tensors_to_device(vae, device)
+            vae.to(device)
+            print(f'VAE is prepared')
             
-            # Reverse normalization: latents = latents * std + mean
-            # Latents are in unpacked format: (1, c, f, h, w)
-            # VAE expects (1, c, h, w) for images, so remove frame dimension
+            mean_tensor = self.vae.latents_mean_tensor.squeeze(2)  # (1, z_dim, 1, 1)
+            std_tensor = self.vae.latents_std_tensor.squeeze(2)  # (1, z_dim, 1, 1)
+
             latents_for_vae = latents.squeeze(2)  # Remove frame dimension: (1, c, h, w)
             latents_for_vae = latents_for_vae * std_tensor + mean_tensor
             
@@ -945,6 +947,9 @@ class QwenImagePipeline(BasePipeline):
                 print(f'Decoding with VAE')
                 decoded = self.vae.decode(latents_for_vae.to(vae.device, vae.dtype))
                 print(f'VAE decoded')
+                self._move_meta_tensors_to_device(vae, 'cpu')
+                vae.to('cpu')
+                print(f'VAE moved to CPU')
                 # Handle VAE output
                 if hasattr(decoded, 'sample'):
                     decoded = decoded.sample
@@ -969,7 +974,6 @@ class QwenImagePipeline(BasePipeline):
             
             # Clean up prompt embeddings and other temporary tensors
             del prompt_embeds_single, prompt_embeds, prompt_embeds_mask, attention_mask, x_t, img_attention_mask
-            
             # Clear CUDA cache after each prompt
             torch.cuda.empty_cache()
         
