@@ -45,19 +45,36 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     weight_swap_jobs = []
     buffer_move_jobs = []  # For buffers that need to be moved (not swapped)
+    param_move_jobs = []  # For parameters that need to be moved (not swapped as weights)
 
     modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    swapped_weight_params = set()  # Track weight parameters that are being swapped
+    
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
         if 'lora' in module_to_cuda_name:
             continue
-        # Handle weights
+        
+        module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
+        
+        # Handle weights (for swapping efficiency)
+        # Collect weight parameters that will be swapped
         if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
-            module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
-            if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
+            if module_to_cpu is not None and module_to_cuda.weight.shape == module_to_cpu.weight.shape:
                 weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+                # Mark this weight parameter as being swapped
+                swapped_weight_params.add(id(module_to_cuda.weight))
             else:
                 if module_to_cuda.weight.data.device.type != device.type:
                     module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+        
+        # Handle ALL parameters explicitly, not just those with weight attribute
+        # This ensures parameters like input_layernorm.weight are moved correctly
+        for param_name, param in module_to_cuda.named_parameters(recurse=False):
+            if param.device.type != device.type:
+                # Skip weight parameters that are being swapped (they're handled above)
+                if id(param) not in swapped_weight_params:
+                    # Non-weight parameter or weight that can't be swapped - needs to be moved to device
+                    param_move_jobs.append((module_to_cuda, param_name, param))
         
         # Handle buffers (like LayerNorm weights, biases, etc.)
         # Buffers are moved directly, not swapped
@@ -65,9 +82,6 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             buffer = module_to_cuda._buffers.get(buffer_name)
             if buffer is not None and buffer.device.type != device.type:
                 buffer_move_jobs.append((module_to_cuda, buffer_name, buffer))
-    
-    # Note: swap_weight_devices_cuda only handles weight swapping for efficiency
-    # All other parameters are moved by wait_for_block() which is called before forward pass
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
@@ -88,9 +102,20 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
         # Move buffers to device
         for module_to_cuda, buffer_name, buffer in buffer_move_jobs:
             module_to_cuda._buffers[buffer_name] = buffer.to(device, non_blocking=True)
+        
+        # Move ALL parameters to device (including non-weight parameters like input_layernorm.weight)
+        # This is critical - these parameters must be on CUDA before forward pass
+        for module_to_cuda, param_name, param in param_move_jobs:
+            # Move parameter data to device
+            # Use non_blocking=True for efficiency, but we synchronize streams below
+            param.data = param.data.to(device, non_blocking=True)
 
+    # Synchronize stream to ensure all operations complete
     stream.synchronize()
+    # Synchronize current stream to ensure all moves are visible
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
+    # Final synchronization ensures all parameter moves are complete before swap function returns
+    # This is critical to prevent device mismatch errors during forward pass
 
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
