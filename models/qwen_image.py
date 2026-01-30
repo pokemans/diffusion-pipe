@@ -825,6 +825,11 @@ class QwenImagePipeline(BasePipeline):
         # This ensures we use the correct device even when block swapping is enabled
         transformer_device = next(self.transformer.img_in.parameters()).device
         transformer_dtype = next(self.transformer.img_in.parameters()).dtype
+        
+        # Get the base dtype for time_text_embed (which is kept in high precision)
+        # time_text_embed outputs temb in base dtype (BFloat16), but img_mod might be quantized
+        # The transformer should handle dtype conversion internally, but we use base dtype for timestep
+        base_dtype = self.model_config['dtype']
 
         for prompt in prompts:
             # --- 1. Handle Cached Embeddings ---
@@ -833,7 +838,8 @@ class QwenImagePipeline(BasePipeline):
                 if prompt in self.sample_prompts:
                     cached_idx = self.sample_prompts.index(prompt)
                     # Force to device immediately upon retrieval - use transformer's device
-                    prompt_embeds = self.sample_prompt_embeds[cached_idx].to(transformer_device, dtype=transformer_dtype)
+                    # Use base_dtype to match what time_text_embed expects
+                    prompt_embeds = self.sample_prompt_embeds[cached_idx].to(transformer_device, dtype=base_dtype)
                 else:
                     raise RuntimeError(f'Prompt "{prompt}" not found in cache.')
             else:
@@ -848,27 +854,30 @@ class QwenImagePipeline(BasePipeline):
                     (1, in_channels, height // 8, width // 8),
                     generator=generator, 
                     device=transformer_device, 
-                    dtype=transformer_dtype
+                    dtype=base_dtype
                 )
 
                 # --- 3. Prepare Sequence and Shapes ---
                 batch, channels, h, w = latents.shape
                 # Flatten and move to transformer's device
-                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(transformer_device, dtype=transformer_dtype)
+                # Use base_dtype for hidden_states since time_text_embed is kept in high precision
+                # and needs to match the dtype expected by the transformer's internal layers
+                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(transformer_device, dtype=base_dtype)
                 
                 # RoPE shapes: Qwen2-VL based models usually need (h, w, 1)
                 img_shapes = [(h, w, 1)]
 
                 # --- 4. Flow Matching Loop ---
                 # timesteps 1.0 -> 0.0
-                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=transformer_device, dtype=transformer_dtype)
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=transformer_device, dtype=base_dtype)
 
                 for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
                     
                     # Qwen-Image FM usually expects 0-1000 float
-                    t_tensor = (t_curr * 1000).expand(batch).to(transformer_device, dtype=transformer_dtype)
+                    # Use base_dtype for timestep since time_text_embed is kept in high precision
+                    t_tensor = (t_curr * 1000).expand(batch).to(transformer_device, dtype=base_dtype)
 
                     # QwenImageTransformer doesn't support guidance parameter
                     # The time_text_embed method only accepts timestep and hidden_states
