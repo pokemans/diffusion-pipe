@@ -324,13 +324,38 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
                 
     finally:
         # Ensure proper cleanup order:
-        # 1. VAE should already be moved to CPU in generate_samples()
-        # 2. Clear CUDA cache to free any remaining GPU memory
-        # 3. Then restore block swap training state (which may move blocks to GPU)
+        # 1. Delete any intermediate tensors that might still be in memory
+        # 2. Move VAE to CPU if it's still on GPU
+        # 3. Clear CUDA cache to free any remaining GPU memory
+        # 4. Then restore block swap training state (which may move blocks to GPU)
+        try:
+            # Explicitly delete decoded tensor if it exists
+            if 'decoded' in locals():
+                del decoded
+            # Ensure VAE is on CPU
+            vae = model.get_vae()
+            if vae is not None:
+                vae.to('cpu')
+        except Exception:
+            pass  # Ignore errors during cleanup
+        
         empty_cuda_cache()
-        model.prepare_block_swap_training()
-        model.prepare_text_encoder_block_swap_training()
-        # Clear cache again after restoring training state to ensure clean state
+        
+        # Restore training state with OOM protection
+        try:
+            model.prepare_block_swap_training()
+            model.prepare_text_encoder_block_swap_training()
+        except torch.cuda.OutOfMemoryError:
+            # If we still OOM, try one more aggressive cleanup
+            empty_cuda_cache()
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            # Try again - if this fails, let it propagate
+            model.prepare_block_swap_training()
+            model.prepare_text_encoder_block_swap_training()
+        
+        # Clear cache again after restoring training state
         empty_cuda_cache()
 
 

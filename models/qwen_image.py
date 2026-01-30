@@ -896,33 +896,41 @@ class QwenImagePipeline(BasePipeline):
         
         # Decode with VAE
         vae = self.get_vae()
-        # Handle meta tensors before moving to device
         try:
-            vae.to(device)
-        except NotImplementedError as e:
-            if "meta tensor" in str(e):
-                # Some parameters/buffers on meta device - manually move them
-                self._move_meta_tensors_to_device(vae, device)
-                # Try again after moving meta tensors
+            # Handle meta tensors before moving to device
+            try:
                 vae.to(device)
-            else:
-                raise
-        
-        # Apply VAE normalization reversal
-        final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
-        
-        # VAE expects (bs, c, f, h, w) format - keep frame dimension even for single images (num_frames=1)
-        # The VAE can handle num_frames=1 for single image generation
-        
-        # Decode
-        decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
-        if hasattr(decoded, 'sample'):
-            decoded = decoded.sample
-        elif isinstance(decoded, dict):
-            decoded = decoded['sample']
-        
-        # Move VAE back to CPU to free GPU memory before block swap restoration
-        vae.to('cpu')
+            except NotImplementedError as e:
+                if "meta tensor" in str(e):
+                    # Some parameters/buffers on meta device - manually move them
+                    self._move_meta_tensors_to_device(vae, device)
+                    # Try again after moving meta tensors
+                    vae.to(device)
+                else:
+                    raise
+            
+            # Apply VAE normalization reversal
+            final_latents = final_latents * self.vae.latents_std_tensor + self.vae.latents_mean_tensor
+            
+            # VAE expects (bs, c, f, h, w) format - keep frame dimension even for single images (num_frames=1)
+            # The VAE can handle num_frames=1 for single image generation
+            
+            # Decode
+            decoded = vae.decode(final_latents.to(vae.device, vae.dtype))
+            if hasattr(decoded, 'sample'):
+                decoded = decoded.sample
+            elif isinstance(decoded, dict):
+                decoded = decoded['sample']
+            
+            # Move VAE back to CPU to free GPU memory before block swap restoration
+            vae.to('cpu')
+        finally:
+            # Ensure VAE is always moved to CPU, even if exception occurs
+            if vae is not None:
+                try:
+                    vae.to('cpu')
+                except Exception:
+                    pass  # Ignore errors during cleanup
         
         # Convert to PIL images
         images = []
@@ -931,6 +939,9 @@ class QwenImagePipeline(BasePipeline):
             # VAE output is in range [-1, 1], convert to [0, 1]
             img = (img + 1) / 2
             img = img.clamp(0, 1)
+            # Squeeze frame dimension if present (for single images, F=1)
+            if img.ndim == 4 and img.shape[1] == 1:
+                img = img.squeeze(1)  # [C, F, H, W] -> [C, H, W] when F=1
             # Convert to PIL
             pil_img = torchvision.transforms.functional.to_pil_image(img)
             images.append(pil_img)
