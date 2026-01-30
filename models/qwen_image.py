@@ -889,8 +889,11 @@ class QwenImagePipeline(BasePipeline):
                 # This is equivalent to: x_1_new = x_t - dt * (x_0 - x_1_old)
                 x_1 = x_t - dt * predicted_target_unpacked
                 
-                # For next iteration, update x_0 to current x_1
-                x_0 = x_1.clone()
+                # For next iteration, update x_0 to current x_1 using in-place copy to avoid memory leak
+                x_0.copy_(x_1)
+                
+                # Explicitly delete intermediate tensors to free memory
+                del x_t, x_t_packed, predicted_target, predicted_target_unpacked, attention_mask, img_attention_mask, img_shapes, txt_seq_lens, t_tensor, model_inputs, x
         
         # Final latents are x_1 (clean latents) - already in spatial format (bs, c, f, h, w)
         final_latents = x_1
@@ -982,6 +985,19 @@ class QwenImagePipeline(BasePipeline):
             # Convert to PIL
             pil_img = torchvision.transforms.functional.to_pil_image(img)
             images.append(pil_img)
+        
+        # Explicitly delete large tensors to free GPU memory before returning
+        del decoded, final_latents, latents, x_0, x_1, prompt_embeds_tensor, prompt_embeds_mask
+        if 'attn_mask_list' in locals():
+            del attn_mask_list
+        if 'timesteps' in locals():
+            del timesteps
+        
+        # Force garbage collection and clear CUDA cache
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return images
 

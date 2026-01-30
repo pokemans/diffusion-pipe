@@ -326,12 +326,23 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
         # Ensure proper cleanup order:
         # 1. Delete any intermediate tensors that might still be in memory
         # 2. Move VAE to CPU if it's still on GPU
-        # 3. Clear CUDA cache to free any remaining GPU memory
-        # 4. Then restore block swap training state (which may move blocks to GPU)
+        # 3. Move cached prompt embeddings to CPU if they're on GPU
+        # 4. Clear CUDA cache to free any remaining GPU memory
+        # 5. Then restore block swap training state (which may move blocks to GPU)
+        import gc
+        
         try:
-            # Explicitly delete decoded tensor if it exists
-            if 'decoded' in locals():
-                del decoded
+            # Explicitly delete generation-related variables that might still be in scope
+            # Note: These deletions help free memory, but Python's GC will handle them anyway
+            # The main benefit is making the intent clear and potentially speeding up GC
+            if 'images' in locals():
+                del images
+            if 'prompts' in locals():
+                del prompts
+        except Exception:
+            pass  # Ignore errors during cleanup
+        
+        try:
             # Ensure VAE is on CPU
             vae = model.get_vae()
             if vae is not None:
@@ -339,7 +350,23 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
         except Exception:
             pass  # Ignore errors during cleanup
         
+        # Move cached prompt embeddings to CPU if they exist and are on GPU
+        try:
+            if hasattr(model, 'sample_prompt_embeds') and model.sample_prompt_embeds is not None:
+                # Check if embeddings are on GPU and move to CPU
+                if isinstance(model.sample_prompt_embeds, list):
+                    model.sample_prompt_embeds = [emb.cpu() if isinstance(emb, torch.Tensor) and emb.device.type == 'cuda' else emb 
+                                                  for emb in model.sample_prompt_embeds]
+                elif isinstance(model.sample_prompt_embeds, torch.Tensor) and model.sample_prompt_embeds.device.type == 'cuda':
+                    model.sample_prompt_embeds = model.sample_prompt_embeds.cpu()
+        except Exception:
+            pass  # Ignore errors during cleanup
+        
+        # Aggressive memory cleanup before restoring training state
         empty_cuda_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Restore training state with OOM protection
         try:
@@ -348,15 +375,18 @@ def generate_samples(model, model_engine, config, epoch, step, save_dir, tb_writ
         except torch.cuda.OutOfMemoryError:
             # If we still OOM, try one more aggressive cleanup
             empty_cuda_cache()
-            import gc
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # Try again - if this fails, let it propagate
             model.prepare_block_swap_training()
             model.prepare_text_encoder_block_swap_training()
         
         # Clear cache again after restoring training state
         empty_cuda_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def distributed_init(args):
