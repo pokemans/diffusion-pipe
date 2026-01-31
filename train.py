@@ -61,7 +61,7 @@ parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
-logging.getLogger('models.qwen_image').setLevel(logging.DEBUG)
+#logging.getLogger('models.qwen_image').setLevel(logging.DEBUG)
 
 
 class DummyOptimizer(torch.optim.Optimizer):

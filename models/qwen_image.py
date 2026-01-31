@@ -703,7 +703,7 @@ class QwenImagePipeline(BasePipeline):
         
         return latents
 
-    def _unpack_latents(self, latents, bs, num_channels_latents, h, w):
+    def _unpack_latents(self, latents_packed, bs, num_channels_latents, h, w):
         """Unpack latents from (bs, seq_len, hidden_dim) back to (bs, c, f, h, w) spatial format."""
         # This method should reverse _pack_latents
         if hasattr(self.transformer, '_unpack_latents'):
