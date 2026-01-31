@@ -824,9 +824,8 @@ class QwenImagePipeline(BasePipeline):
         # We use the layer-based forward (to_layers) so the offloader can move blocks to GPU just-in-time.
         transformer_device = next(self.transformer.img_in.parameters()).device
         base_dtype = self.model_config['dtype']
-        bs = 1
+        bs, channels, num_frames, h, w = latents.shape
         num_channels_latents = self.transformer.config.in_channels // 4
-        h, w = height // 8, width // 8
         img_seq_len = (h // 2) * (w // 2)
 
         for prompt in prompts:
@@ -869,8 +868,8 @@ class QwenImagePipeline(BasePipeline):
                 for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
-                    t_tensor = (t_curr * 1000).expand(bs).to(transformer_device, dtype=base_dtype)
-                    #t_tensor = t_curr.expand(bs).to(transformer_device, dtype=base_dtype)
+                    #t_tensor = (t_curr * 1000).expand(bs).to(transformer_device, dtype=base_dtype)
+                    t_tensor = t_curr.expand(bs).to(transformer_device, dtype=base_dtype)
 
                     model_inputs = (
                         latents_seq,
