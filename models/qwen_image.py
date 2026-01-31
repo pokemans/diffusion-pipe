@@ -905,17 +905,7 @@ class QwenImagePipeline(BasePipeline):
                         )
                     latents_seq = latents_seq + model_output * dt
 
-                scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
-                if scaling_factor is not None:
-                    # Check if scaling_factor needs to be broadcast over the 'Time' dimension (dim 2)
-                    if isinstance(scaling_factor, torch.Tensor):
-                        # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
-                        # Ensure it broadcasts correctly:
-                        scaling_factor = scaling_factor.to(latents.device)
-                        if scaling_factor.ndim < latents.ndim:
-                            # Add missing dimensions until it matches
-                            while scaling_factor.ndim < latents.ndim:
-                                scaling_factor = scaling_factor.unsqueeze(-1)
+                scaling_factor = 2 ** len(self.vae.temperal_downsample)
 
                 latents_packed = latents_seq
                 latents = self._unpack_latents(latents_packed, h, w, scaling_factor)
