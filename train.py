@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import wandb
 # Disable comfy_kitchen during training to avoid autograd errors
@@ -58,6 +59,9 @@ parser.add_argument('--master_port', type=int, default=29500, help='Master port 
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
+logging.getLogger('models.qwen_image').setLevel(logging.DEBUG)
 
 
 class DummyOptimizer(torch.optim.Optimizer):
