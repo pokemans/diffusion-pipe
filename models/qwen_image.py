@@ -683,25 +683,16 @@ class QwenImagePipeline(BasePipeline):
             print("Using transformer._pack_latents")
             return self.transformer._pack_latents(latents, bs, num_channels_latents, h, w)
         
-        # Fallback implementation: pack 2x2 patches
-        # latents shape: (bs, num_channels_latents, num_frames, h, w)
-        # Pack into sequence: (bs, seq_len, hidden_dim) where hidden_dim = num_channels_latents * 4
-        # and seq_len = (h//2) * (w//2) * num_frames
-        
-        bs_actual, c, num_frames, h_spatial, w_spatial = latents.shape
-        assert bs_actual == bs
-        assert c == num_channels_latents
-        
-        # Pack 2x2 patches: (h, w) -> (h//2, w//2) with 4x channels
-        # Reshape to extract 2x2 patches: (bs, c, f, h, w) -> (bs, c, f, h//2, 2, w//2, 2)
-        latents = latents.reshape(bs, c, num_frames, h_spatial // 2, 2, w_spatial // 2, 2)
-        # Permute to group patch elements: (bs, c, f, h//2, w//2, 2, 2)
-        latents = latents.permute(0, 2, 3, 5, 1, 4, 6)  # (bs, f, h//2, w//2, c, 2, 2)
-        # Flatten patch: (bs, f, h//2, w//2, c*4)
-        latents = latents.reshape(bs, num_frames, h_spatial // 2, w_spatial // 2, c * 4)
-        # Flatten spatial and frame: (bs, f*(h//2)*(w//2), c*4)
-        latents = latents.reshape(bs, num_frames * (h_spatial // 2) * (w_spatial // 2), c * 4)
-        
+        # latents: (bs, c, f, h, w)
+        # 1. Reshape to split h and w into 2x2 blocks
+        latents = latents.reshape(bs, num_channels_latents, 1, h // 2, 2, w // 2, 2)
+    
+        # 2. Permute to: (bs, f, h//2, w//2, 2, 2, c)
+        # This puts the spatial patch (2, 2) and channels (c) at the end
+        latents = latents.permute(0, 2, 3, 5, 4, 6, 1)
+    
+        # 3. Flatten the last three dims (2 * 2 * c) into the hidden dim
+        latents = latents.reshape(bs, (h // 2) * (w // 2), num_channels_latents * 4)
         return latents
 
     def _unpack_latents(self, latents_packed, bs, num_channels_latents, h, w):
@@ -711,24 +702,15 @@ class QwenImagePipeline(BasePipeline):
             print("Using transformer._unpack_latents")
             return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
         
-        # latents_packed shape: (bs, seq_len, c * 4)
-        # 1. Undo the sequence flattening
-        # Shape: (bs, 1, h // 2, w // 2, num_channels_latents * 4)
-        x = latents_packed.view(bs, 1, h // 2, w // 2, num_channels_latents * 4)
-
-        # 2. Undo the patch flattening (c*4 -> c, 2, 2)
-        # Shape: (bs, 1, h // 2, w // 2, num_channels_latents, 2, 2)
-        x = x.view(bs, 1, h // 2, w // 2, num_channels_latents, 2, 2)
-
-        # 3. Undo the permutation: (bs, f, h//2, w//2, c, 2, 2) -> (bs, c, f, h//2, 2, w//2, 2)
-        # The original was permute(0, 2, 3, 5, 1, 4, 6), so we reverse it:
-        x = x.permute(0, 4, 1, 2, 5, 3, 6)
-
-        # 4. Final reshape to spatial dimensions
-        # Shape: (bs, num_channels_latents, 1, h, w)
-        x = x.reshape(bs, num_channels_latents, 1, h, w)
-
-        return x
+        # latents_packed: (bs, seq_len, c * 4)
+        # 1. Reshape to (bs, 1, h//2, w//2, 2, 2, c)
+        latents = latents_packed.view(bs, 1, h // 2, w // 2, 2, 2, num_channels_latents)
+        # 2. Permute back to (bs, c, f, h//2, 2, w//2, 2)
+        # This reverses the permute(0, 2, 3, 5, 4, 6, 1) from the pack function
+        latents = latents.permute(0, 6, 1, 2, 4, 3, 5)
+        # 3. Reshape to (bs, c, 1, h, w)
+        latents = latents.reshape(bs, num_channels_latents, 1, h, w)
+        return latents
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
