@@ -905,10 +905,10 @@ class QwenImagePipeline(BasePipeline):
                         )
                     latents_seq = latents_seq + model_output * dt
 
-                scaling_factor = 2 ** len(self.vae.temperal_downsample)
+                scaling_factor = 2 ** (len(self.vae.config.dim_mult) - 1)
 
                 latents_packed = latents_seq
-                latents = self._unpack_latents(latents_packed, h, w, scaling_factor)
+                latents = self._unpack_latents(latents_packed, height, width, scaling_factor)
 
                 vae_param = next(self.vae.parameters(), None)
                 if vae_param is None:
