@@ -675,7 +675,7 @@ class QwenImagePipeline(BasePipeline):
             return {'prompt_embeds': prompt_embeds}
         return fn
 
-    def _pack_latents(self, latents, bs, num_channels_latents, h, w):
+    def _xpack_latents(self, latents, bs, num_channels_latents, h, w):
         """Pack latents from (bs, c, f, h, w) to (bs, seq_len, hidden_dim) sequence format."""
         # This method should match what the transformer's img_in expects
         # For now, delegate to transformer if it has the method, otherwise use einops-style packing
@@ -696,7 +696,7 @@ class QwenImagePipeline(BasePipeline):
         latents = latents.reshape(bs, (h // 2) * (w // 2), num_channels_latents * 4)
         return latents
 
-    def _unpack_latents(self, latents_packed, bs, num_channels_latents, h, w):
+    def _xunpack_latents(self, latents_packed, bs, num_channels_latents, h, w):
         """Unpack latents from (bs, seq_len, hidden_dim) back to (bs, c, f, h, w) spatial format."""
         # This method should reverse _pack_latents
         if hasattr(self.transformer, '_unpack_latents'):
@@ -905,10 +905,20 @@ class QwenImagePipeline(BasePipeline):
                         )
                     latents_seq = latents_seq + model_output * dt
 
+                scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
+                if scaling_factor is not None:
+                    # Check if scaling_factor needs to be broadcast over the 'Time' dimension (dim 2)
+                    if isinstance(scaling_factor, torch.Tensor):
+                        # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
+                        # Ensure it broadcasts correctly:
+                        scaling_factor = scaling_factor.to(latents.device)
+                        if scaling_factor.ndim < latents.ndim:
+                            # Add missing dimensions until it matches
+                            while scaling_factor.ndim < latents.ndim:
+                                scaling_factor = scaling_factor.unsqueeze(-1)
+
                 latents_packed = latents_seq
-                latents_spatial = self._unpack_latents(latents_packed, bs, num_channels_latents, h, w)
-                # QwenImage VAE decode expects (batch, channels, num_frame, height, width)
-                latents = latents_spatial
+                latents = self._unpack_latents(latents_packed, h, w, scaling_factor)
 
                 vae_param = next(self.vae.parameters(), None)
                 if vae_param is None:
@@ -927,21 +937,11 @@ class QwenImagePipeline(BasePipeline):
                     'generate_samples: after unpack latents.shape=%s min=%s max=%s mean=%s',
                     latents.shape, latents.min().item(), latents.max().item(), latents.float().mean().item(),
                 )
-                scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
+                
                 #if scaling_factor is not None:
                 #    latents = latents / scaling_factor
-                if scaling_factor is not None:
-                    # Check if scaling_factor needs to be broadcast over the 'Time' dimension (dim 2)
-                    if isinstance(scaling_factor, torch.Tensor):
-                        # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
-                        # Ensure it broadcasts correctly:
-                        scaling_factor = scaling_factor.to(latents.device)
-                        if scaling_factor.ndim < latents.ndim:
-                            # Add missing dimensions until it matches
-                            while scaling_factor.ndim < latents.ndim:
-                                scaling_factor = scaling_factor.unsqueeze(-1)
-    
-                    latents = latents / scaling_factor
+                #if scaling_factor is not None:
+                #    latents = latents / scaling_factor
                 # Qwen-style VAE: denormalize (model predicts normalized space; decoder expects raw)
                 latents_mean_buf = getattr(self.vae, 'latents_mean_tensor', None)
                 latents_std_buf = getattr(self.vae, 'latents_std_tensor', None)
