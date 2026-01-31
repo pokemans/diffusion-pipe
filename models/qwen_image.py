@@ -701,7 +701,7 @@ class QwenImagePipeline(BasePipeline):
         # This method should reverse _pack_latents
         if hasattr(self.transformer, '_unpack_latents'):
             print("Using transformer._unpack_latents")
-            return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
+            return self.transformer._unpack_latents(latents_packed, bs, num_channels_latents, h, w)
         
         # 1. Reshape back to the 2x2 blocks: (B, H//2, W//2, 2, 2, C)
         latents = latents_packed.view(bs, h // 2, w // 2, 2, 2, num_channels_latents)
@@ -715,6 +715,11 @@ class QwenImagePipeline(BasePipeline):
         # 4. Add back the 1-frame dim for the VAE if your VAE requires 5D
         latents = latents.unsqueeze(2) 
         return latents
+
+    def _packed_64_to_patch_mean(self, x):
+        """Reduce packed (B, seq, 64) to patch-mean (B, seq, 16). Layout: 64 = 4 spatial * 16 channels."""
+        # (B, seq, 64) -> (B, seq, 4, 16), then mean over the 4 spatial positions
+        return x.reshape(x.shape[0], x.shape[1], 4, 16).mean(dim=2)
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
@@ -778,7 +783,12 @@ class QwenImagePipeline(BasePipeline):
         t_expanded = t.view(-1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
-        logger.debug('prepare_inputs: target.shape=%s latents.shape=%s', target.shape, latents.shape)
+        target_16 = self._packed_64_to_patch_mean(target)
+        if mask is not None and mask.numel() > 0:
+            mask_16 = mask[:, :, :1].expand(-1, -1, 16)
+        else:
+            mask_16 = mask
+        logger.debug('prepare_inputs: target.shape=%s latents.shape=%s', target_16.shape, latents.shape)
 
         img_shapes = [(1, h // 2, w // 2)]
 
@@ -803,7 +813,7 @@ class QwenImagePipeline(BasePipeline):
 
         return (
             (x_t, prompt_embeds, attention_mask, t, img_shapes, txt_seq_lens) + extra,
-            (target, mask),
+            (target_16, mask_16),
         )
 
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
