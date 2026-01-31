@@ -916,6 +916,8 @@ class QwenImagePipeline(BasePipeline):
                 scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
                 if scaling_factor is not None:
                     latents = latents / scaling_factor
+                # Inverse of encoding normalization: flow evolves normalized latents; decoder expects raw.
+                latents = latents * self.vae.latents_std_tensor.to(latents.device) + self.vae.latents_mean_tensor.to(latents.device)
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
                     image = image.squeeze(2)
