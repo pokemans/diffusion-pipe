@@ -707,20 +707,24 @@ class QwenImagePipeline(BasePipeline):
         """Unpack latents from (bs, seq_len, hidden_dim) back to (bs, c, f, h, w) spatial format."""
         # This method should reverse _pack_latents
         if hasattr(self.transformer, '_unpack_latents'):
+            print("Using transformer._unpack_latents")
             return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
         
-        x = latents_packed.view(bs, h // 2, w // 2, num_channels_latents, 2, 2)
-        # 2. Permute to correct spatial order
-        # Mo ve the '2' dimensions next to height and width
-        # Target: (bs, channels, height//2, 2, width//2, 2)
-        x = x.permute(0, 3, 1, 4, 2, 5)
-    
-        # 3. Collapse into final image spatial dimensions
-        # Shape: (bs, channels, height, width)
-        x = x.reshape(bs, num_channels_latents, h, w)
-    
-        # 4. Add the temporal dimension back (needed for the VAE)
-        x = x.unsqueeze(2) # (bs, channels, 1, h, w)
+        x = latents_packed.view(bs, h // 2, w // 2, 2, 2, num_channels_latents)
+
+        # 2. Move the patch dimensions (dims 3 and 4) to be next to spatial dims (1 and 2)
+        # Target: (bs, h//2, 2, w//2, 2, channels)
+        x = x.permute(0, 1, 3, 2, 4, 5)
+
+        # 3. Collapse to final spatial resolution
+        # Shape: (bs, h, w, channels)
+        x = x.reshape(bs, h, w, num_channels_latents)
+
+        # 4. Permute to (bs, channels, h, w) for the VAE
+        x = x.permute(0, 3, 1, 2)
+
+        # 5. Add the time dimension (bs, channels, 1, h, w)
+        x = x.unsqueeze(2) 
     
         return x
 
@@ -872,6 +876,7 @@ class QwenImagePipeline(BasePipeline):
                 for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
+                    #t_tensor = (t_curr * 1000).expand(bs).to(transformer_device, dtype=base_dtype)
                     t_tensor = t_curr.expand(bs).to(transformer_device, dtype=base_dtype)
 
                     model_inputs = (
@@ -936,7 +941,7 @@ class QwenImagePipeline(BasePipeline):
                              scaling_factor = scaling_factor.unsqueeze(-1)
     
                     latents = latents / scaling_factor
-                    
+
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
                     image = image.squeeze(2)
