@@ -833,8 +833,7 @@ class QwenImagePipeline(BasePipeline):
         transformer_device = next(self.transformer.img_in.parameters()).device
         base_dtype = self.model_config['dtype']
         bs = 1
-        num_channels_latents = self.transformer.config.in_channels 
-        #num_channels_latents = self.transformer.config.in_channels // 4
+        num_channels_latents = self.transformer.config.in_channels // 4
         h, w = height // 8, width // 8
         img_seq_len = (h // 2) * (w // 2)
 
@@ -927,9 +926,9 @@ class QwenImagePipeline(BasePipeline):
                 self.vae.to(decode_device)
                 vae_dtype = vae_param.dtype
                 latents = latents.to(decode_device, dtype=vae_dtype)
-                scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
-                if scaling_factor is not None:
-                    latents = latents / scaling_factor
+                #scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
+                #if scaling_factor is not None:
+                #    latents = latents / scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
                     image = image.squeeze(2)
