@@ -561,7 +561,15 @@ if __name__ == '__main__':
     }
     caching_batch_size = config.get('caching_batch_size', 1)
     text_encoder_cache_on_cpu = config.get('text_encoder_cache_on_cpu', False)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, text_encoder_cache_on_cpu=text_encoder_cache_on_cpu)
+    sample_generation_enabled = config.get('sample_generation', {}).get('enabled', False)
+    dataset_manager = dataset_util.DatasetManager(
+        model,
+        regenerate_cache=regenerate_cache,
+        trust_cache=args.trust_cache,
+        caching_batch_size=caching_batch_size,
+        text_encoder_cache_on_cpu=text_encoder_cache_on_cpu,
+        keep_vae_on_cpu_when_unloading=sample_generation_enabled,
+    )
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)

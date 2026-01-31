@@ -1089,7 +1089,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
-    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, text_encoder_cache_on_cpu=False):
+    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, text_encoder_cache_on_cpu=False, keep_vae_on_cpu_when_unloading=False):
         self.model = model
         self.vae = self.model.get_vae()
         self.text_encoders = self.model.get_text_encoders()
@@ -1104,6 +1104,7 @@ class DatasetManager:
         self.trust_cache = trust_cache
         self.caching_batch_size = caching_batch_size
         self.text_encoder_cache_on_cpu = text_encoder_cache_on_cpu
+        self.keep_vae_on_cpu_when_unloading = keep_vae_on_cpu_when_unloading
         self.datasets = []
 
     def register(self, dataset):
@@ -1154,8 +1155,8 @@ class DatasetManager:
             for model in self.submodels:
                 if not isinstance(model, nn.Module):
                     continue
-                if self.model.name == 'sdxl' and model is self.vae:
-                    # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
+                if (self.model.name == 'sdxl' and model is self.vae) or (model is self.vae and self.keep_vae_on_cpu_when_unloading):
+                    # Keep VAE on CPU so it can be moved back to GPU (e.g. for sample generation decode).
                     model.to('cpu')
                 else:
                     model.to('meta')
