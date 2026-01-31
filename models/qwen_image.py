@@ -926,21 +926,21 @@ class QwenImagePipeline(BasePipeline):
                 self.vae.to(decode_device)
                 vae_dtype = vae_param.dtype
                 latents = latents.to(decode_device, dtype=vae_dtype)
-                #scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
+                scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
                 #if scaling_factor is not None:
                 #    latents = latents / scaling_factor
                 if scaling_factor is not None:
-                # Check if scaling_factor needs to be broadcast over the 'Time' dimension (dim 2)
-                if isinstance(scaling_factor, torch.Tensor):
-                    # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
-                    # Ensure it broadcasts correctly:
-                    scaling_factor = scaling_factor.to(latents.device)
-                    if scaling_factor.ndim < latents.ndim:
-                        # Add missing dimensions until it matches
-                        while scaling_factor.ndim < latents.ndim:
-                            scaling_factor = scaling_factor.unsqueeze(-1)
+                    # Check if scaling_factor needs to be broadcast over the 'Time' dimension (dim 2)
+                    if isinstance(scaling_factor, torch.Tensor):
+                        # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
+                        # Ensure it broadcasts correctly:
+                        scaling_factor = scaling_factor.to(latents.device)
+                        if scaling_factor.ndim < latents.ndim:
+                            # Add missing dimensions until it matches
+                            while scaling_factor.ndim < latents.ndim:
+                                scaling_factor = scaling_factor.unsqueeze(-1)
     
-                latents = latents / scaling_factor
+                    latents = latents / scaling_factor
 
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
