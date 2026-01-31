@@ -684,7 +684,7 @@ class QwenImagePipeline(BasePipeline):
             return self.transformer._pack_latents(latents, bs, num_channels_latents, h, w)
         
         if latents.ndim == 5:
-        latents = latents.squeeze(2) # Remove the 'frame' dimension
+            latents = latents.squeeze(2) # Remove the 'frame' dimension
     
         # 2. Reshape to (B, C, H//2, 2, W//2, 2)
         latents = latents.view(bs, num_channels_latents, h // 2, 2, w // 2, 2)
@@ -695,7 +695,7 @@ class QwenImagePipeline(BasePipeline):
         # 4. Flatten to (B, Seq_Len, C*4)
         latents = latents.reshape(bs, (h // 2) * (w // 2), num_channels_latents * 4)
         return latents
-        
+
     def _unpack_latents(self, latents_packed, bs, num_channels_latents, h, w):
         """Unpack latents from (bs, seq_len, hidden_dim) back to (bs, c, f, h, w) spatial format."""
         # This method should reverse _pack_latents
