@@ -816,6 +816,29 @@ class QwenImagePipeline(BasePipeline):
             (target_16, mask_16),
         )
 
+    def get_loss_fn(self):
+        """Loss that matches 16-dim patch-mean target to output; expands target to 64 when pipeline output is 64-dim."""
+        def loss_fn(output, label):
+            target, mask = label
+            with torch.autocast('cuda', enabled=False):
+                output = output.to(torch.float32)
+                target = target.to(output.device, torch.float32)
+                # Pipeline partitioning may put FinalLayer on an earlier stage, so output can be 64-dim (hidden) or 16-dim (proj_out).
+                if output.size(-1) == 64 and target.size(-1) == 16:
+                    target = target.repeat_interleave(4, dim=-1)
+                    if mask is not None and mask.numel() > 0 and mask.size(-1) == 16:
+                        mask = mask.repeat_interleave(4, dim=-1)
+                if 'pseudo_huber_c' in self.config:
+                    c = self.config['pseudo_huber_c']
+                    loss = torch.sqrt((output - target) ** 2 + c ** 2) - c
+                else:
+                    loss = F.mse_loss(output, target, reduction='none')
+                if mask is not None and mask.numel() > 0:
+                    mask = mask.to(output.device, torch.float32)
+                    loss = loss * mask
+                return loss.mean()
+        return loss_fn
+
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         images = []
         
