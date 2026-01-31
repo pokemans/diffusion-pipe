@@ -899,6 +899,10 @@ class QwenImagePipeline(BasePipeline):
                             'generate_samples (first step): latents_seq=%s model_output_before=%s expanded=%s ratio=%s model_output_after=%s',
                             latents_seq.shape, model_output_before, expanded, ratio, model_output.shape,
                         )
+                        logger.debug(
+                            'generate_samples (first step): model_output min=%s max=%s mean=%s',
+                            model_output.min().item(), model_output.max().item(), model_output.float().mean().item(),
+                        )
                     latents_seq = latents_seq + model_output * dt
 
                 latents_packed = latents_seq
@@ -919,6 +923,10 @@ class QwenImagePipeline(BasePipeline):
                 self.vae.to(decode_device)
                 vae_dtype = vae_param.dtype
                 latents = latents.to(decode_device, dtype=vae_dtype)
+                logger.debug(
+                    'generate_samples: after unpack latents.shape=%s min=%s max=%s mean=%s',
+                    latents.shape, latents.min().item(), latents.max().item(), latents.float().mean().item(),
+                )
                 scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
                 #if scaling_factor is not None:
                 #    latents = latents / scaling_factor
@@ -934,6 +942,17 @@ class QwenImagePipeline(BasePipeline):
                                 scaling_factor = scaling_factor.unsqueeze(-1)
     
                     latents = latents / scaling_factor
+                # Qwen-style VAE: denormalize (model predicts normalized space; decoder expects raw)
+                latents_mean_buf = getattr(self.vae, 'latents_mean_tensor', None)
+                latents_std_buf = getattr(self.vae, 'latents_std_tensor', None)
+                if latents_mean_buf is not None and latents_std_buf is not None:
+                    latents_mean_buf = latents_mean_buf.to(device=latents.device, dtype=latents.dtype)
+                    latents_std_buf = latents_std_buf.to(device=latents.device, dtype=latents.dtype)
+                    latents = latents * latents_std_buf + latents_mean_buf
+                logger.debug(
+                    'generate_samples: before decode latents.shape=%s min=%s max=%s mean=%s',
+                    latents.shape, latents.min().item(), latents.max().item(), latents.float().mean().item(),
+                )
 
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
