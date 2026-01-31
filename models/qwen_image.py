@@ -901,7 +901,9 @@ class QwenImagePipeline(BasePipeline):
                 vae_device = next(self.vae.parameters()).device
                 vae_dtype = next(self.vae.parameters()).dtype
                 latents = latents.to(vae_device, dtype=vae_dtype)
-                latents = latents / self.vae.config.scaling_factor
+                scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
+                if scaling_factor is not None:
+                    latents = latents / scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
 
                 image = (image / 2 + 0.5).clamp(0, 1)
