@@ -680,6 +680,7 @@ class QwenImagePipeline(BasePipeline):
         # This method should match what the transformer's img_in expects
         # For now, delegate to transformer if it has the method, otherwise use einops-style packing
         if hasattr(self.transformer, '_pack_latents'):
+            print("Using transformer._pack_latents")
             return self.transformer._pack_latents(latents, bs, num_channels_latents, h, w)
         
         # Fallback implementation: pack 2x2 patches
@@ -710,22 +711,23 @@ class QwenImagePipeline(BasePipeline):
             print("Using transformer._unpack_latents")
             return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
         
-        x = latents_packed.view(bs, h // 2, w // 2, 2, 2, num_channels_latents)
+        # latents_packed shape: (bs, seq_len, c * 4)
+        # 1. Undo the sequence flattening
+        # Shape: (bs, 1, h // 2, w // 2, num_channels_latents * 4)
+        x = latents_packed.view(bs, 1, h // 2, w // 2, num_channels_latents * 4)
 
-        # 2. Move the patch dimensions (dims 3 and 4) to be next to spatial dims (1 and 2)
-        # Target: (bs, h//2, 2, w//2, 2, channels)
-        x = x.permute(0, 1, 3, 2, 4, 5)
+        # 2. Undo the patch flattening (c*4 -> c, 2, 2)
+        # Shape: (bs, 1, h // 2, w // 2, num_channels_latents, 2, 2)
+        x = x.view(bs, 1, h // 2, w // 2, num_channels_latents, 2, 2)
 
-        # 3. Collapse to final spatial resolution
-        # Shape: (bs, h, w, channels)
-        x = x.reshape(bs, h, w, num_channels_latents)
+        # 3. Undo the permutation: (bs, f, h//2, w//2, c, 2, 2) -> (bs, c, f, h//2, 2, w//2, 2)
+        # The original was permute(0, 2, 3, 5, 1, 4, 6), so we reverse it:
+        x = x.permute(0, 4, 1, 2, 5, 3, 6)
 
-        # 4. Permute to (bs, channels, h, w) for the VAE
-        x = x.permute(0, 3, 1, 2)
+        # 4. Final reshape to spatial dimensions
+        # Shape: (bs, num_channels_latents, 1, h, w)
+        x = x.reshape(bs, num_channels_latents, 1, h, w)
 
-        # 5. Add the time dimension (bs, channels, 1, h, w)
-        x = x.unsqueeze(2) 
-    
         return x
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
