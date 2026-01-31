@@ -833,7 +833,8 @@ class QwenImagePipeline(BasePipeline):
         transformer_device = next(self.transformer.img_in.parameters()).device
         base_dtype = self.model_config['dtype']
         bs = 1
-        num_channels_latents = self.transformer.config.in_channels // 4
+        num_channels_latents = self.transformer.config.in_channels 
+        #num_channels_latents = self.transformer.config.in_channels // 4
         h, w = height // 8, width // 8
         img_seq_len = (h // 2) * (w // 2)
 
