@@ -709,25 +709,20 @@ class QwenImagePipeline(BasePipeline):
         if hasattr(self.transformer, '_unpack_latents'):
             return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
         
-        # Fallback implementation: unpack 2x2 patches
-        bs_actual, seq_len, hidden_dim = latents.shape
-        assert bs_actual == bs
-        assert hidden_dim == num_channels_latents * 4
-        
-        # Calculate dimensions
-        # seq_len = num_frames * (h//2) * (w//2)
-        h_spatial = h
-        w_spatial = w
-        num_frames = seq_len // ((h_spatial // 2) * (w_spatial // 2))
-        
-        # Reshape: (bs, seq_len, hidden_dim) -> (bs, f, h//2, w//2, c, 2, 2)
-        latents = latents.reshape(bs, num_frames, h_spatial // 2, w_spatial // 2, num_channels_latents, 2, 2)
-        # Permute back: (bs, f, h//2, w//2, c, 2, 2) -> (bs, c, f, h//2, 2, w//2, 2)
-        latents = latents.permute(0, 4, 1, 2, 5, 3, 6)  # (bs, c, f, h//2, 2, w//2, 2)
-        # Reshape to (bs, c, f, h, w)
-        latents = latents.reshape(bs, num_channels_latents, num_frames, h_spatial, w_spatial)
-        
-        return latents
+        x = latents_packed.view(bs, h // 2, w // 2, num_channels_latents, 2, 2)
+        # 2. Permute to correct spatial order
+        # Mo ve the '2' dimensions next to height and width
+        # Target: (bs, channels, height//2, 2, width//2, 2)
+        x = x.permute(0, 3, 1, 4, 2, 5)
+    
+        # 3. Collapse into final image spatial dimensions
+        # Shape: (bs, channels, height, width)
+        x = x.reshape(bs, num_channels_latents, h, w)
+    
+        # 4. Add the temporal dimension back (needed for the VAE)
+        x = x.unsqueeze(2) # (bs, channels, 1, h, w)
+    
+        return x
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
