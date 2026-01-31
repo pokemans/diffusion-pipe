@@ -683,18 +683,19 @@ class QwenImagePipeline(BasePipeline):
             print("Using transformer._pack_latents")
             return self.transformer._pack_latents(latents, bs, num_channels_latents, h, w)
         
-        # latents: (bs, c, f, h, w)
-        # 1. Reshape to split h and w into 2x2 blocks
-        latents = latents.reshape(bs, num_channels_latents, 1, h // 2, 2, w // 2, 2)
+        if latents.ndim == 5:
+        latents = latents.squeeze(2) # Remove the 'frame' dimension
     
-        # 2. Permute to: (bs, f, h//2, w//2, 2, 2, c)
-        # This puts the spatial patch (2, 2) and channels (c) at the end
-        latents = latents.permute(0, 2, 3, 5, 4, 6, 1)
+        # 2. Reshape to (B, C, H//2, 2, W//2, 2)
+        latents = latents.view(bs, num_channels_latents, h // 2, 2, w // 2, 2)
     
-        # 3. Flatten the last three dims (2 * 2 * c) into the hidden dim
+        # 3. Permute to (B, H//2, W//2, 2, 2, C) - This is the standard "Space-to-Depth"
+        latents = latents.permute(0, 2, 4, 3, 5, 1)
+    
+        # 4. Flatten to (B, Seq_Len, C*4)
         latents = latents.reshape(bs, (h // 2) * (w // 2), num_channels_latents * 4)
         return latents
-
+        
     def _unpack_latents(self, latents_packed, bs, num_channels_latents, h, w):
         """Unpack latents from (bs, seq_len, hidden_dim) back to (bs, c, f, h, w) spatial format."""
         # This method should reverse _pack_latents
@@ -702,14 +703,17 @@ class QwenImagePipeline(BasePipeline):
             print("Using transformer._unpack_latents")
             return self.transformer._unpack_latents(latents, bs, num_channels_latents, h, w)
         
-        # latents_packed: (bs, seq_len, c * 4)
-        # 1. Reshape to (bs, 1, h//2, w//2, 2, 2, c)
-        latents = latents_packed.view(bs, 1, h // 2, w // 2, 2, 2, num_channels_latents)
-        # 2. Permute back to (bs, c, f, h//2, 2, w//2, 2)
-        # This reverses the permute(0, 2, 3, 5, 4, 6, 1) from the pack function
-        latents = latents.permute(0, 6, 1, 2, 4, 3, 5)
-        # 3. Reshape to (bs, c, 1, h, w)
-        latents = latents.reshape(bs, num_channels_latents, 1, h, w)
+        # 1. Reshape back to the 2x2 blocks: (B, H//2, W//2, 2, 2, C)
+        latents = latents_packed.view(bs, h // 2, w // 2, 2, 2, num_channels_latents)
+    
+        # 2 Reverse the permute: (B, C, H//2, 2, W//2, 2)
+        latents = latents.permute(0, 5, 1, 3, 2, 4)
+    
+        # 3. Reshape to standard 4D: (B, C, H, W)
+        latents = latents.reshape(bs, num_channels_latents, h, w)
+    
+        # 4. Add back the 1-frame dim for the VAE if your VAE requires 5D
+        latents = latents.unsqueeze(2) 
         return latents
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
