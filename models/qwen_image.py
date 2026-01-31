@@ -243,6 +243,7 @@ class QwenImagePipeline(BasePipeline):
             vae = diffusers.AutoencoderKLQwenImage.from_config(vae_config)
         for key, tensor in iterate_safetensors(vae_path):
             set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype, value=tensor)
+        self._move_meta_tensors_to_device(vae, 'cpu')
 
         self.diffusers_pipeline = diffusers.QwenImagePipeline(
             scheduler=None,
@@ -899,9 +900,18 @@ class QwenImagePipeline(BasePipeline):
                 # QwenImage VAE decode expects (batch, channels, num_frame, height, width)
                 latents = latents_spatial
 
+                vae_param = next(self.vae.parameters(), None)
+                if vae_param is None:
+                    raise RuntimeError('VAE has no parameters.')
+                has_meta = any(p.device.type == 'meta' for p in self.vae.parameters())
+                if has_meta:
+                    raise RuntimeError(
+                        'VAE has meta tensors; cannot move to device or decode. '
+                        'Ensure the VAE is fully loaded (e.g. _move_meta_tensors_to_device after loading).'
+                    )
                 decode_device = transformer_device
                 self.vae.to(decode_device)
-                vae_dtype = next(self.vae.parameters()).dtype
+                vae_dtype = vae_param.dtype
                 latents = latents.to(decode_device, dtype=vae_dtype)
                 scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
                 if scaling_factor is not None:
