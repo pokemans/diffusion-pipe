@@ -783,12 +783,7 @@ class QwenImagePipeline(BasePipeline):
         t_expanded = t.view(-1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
-        target_16 = self._packed_64_to_patch_mean(target)
-        if mask is not None and mask.numel() > 0:
-            mask_16 = mask[:, :, :1].expand(-1, -1, 16)
-        else:
-            mask_16 = mask
-        logger.debug('prepare_inputs: target.shape=%s latents.shape=%s', target_16.shape, latents.shape)
+        logger.debug('prepare_inputs: target.shape=%s latents.shape=%s', target.shape, latents.shape)
 
         img_shapes = [(1, h // 2, w // 2)]
 
@@ -813,31 +808,8 @@ class QwenImagePipeline(BasePipeline):
 
         return (
             (x_t, prompt_embeds, attention_mask, t, img_shapes, txt_seq_lens) + extra,
-            (target_16, mask_16),
+            (target, mask),
         )
-
-    def get_loss_fn(self):
-        """Loss that matches 16-dim patch-mean target to output; expands target to 64 when pipeline output is 64-dim."""
-        def loss_fn(output, label):
-            target, mask = label
-            with torch.autocast('cuda', enabled=False):
-                output = output.to(torch.float32)
-                target = target.to(output.device, torch.float32)
-                # Pipeline partitioning may put FinalLayer on an earlier stage, so output can be 64-dim (hidden) or 16-dim (proj_out).
-                if output.size(-1) == 64 and target.size(-1) == 16:
-                    target = target.repeat_interleave(4, dim=-1)
-                    if mask is not None and mask.numel() > 0 and mask.size(-1) == 16:
-                        mask = mask.repeat_interleave(4, dim=-1)
-                if 'pseudo_huber_c' in self.config:
-                    c = self.config['pseudo_huber_c']
-                    loss = torch.sqrt((output - target) ** 2 + c ** 2) - c
-                else:
-                    loss = F.mse_loss(output, target, reduction='none')
-                if mask is not None and mask.numel() > 0:
-                    mask = mask.to(output.device, torch.float32)
-                    loss = loss * mask
-                return loss.mean()
-        return loss_fn
 
     def generate_samples(self, prompts, num_inference_steps, height, width, seed, guidance_scale=None):
         images = []
