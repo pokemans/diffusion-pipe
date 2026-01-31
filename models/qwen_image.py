@@ -874,8 +874,8 @@ class QwenImagePipeline(BasePipeline):
                 for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
-                    #t_tensor = (t_curr * 1000).expand(bs).to(transformer_device, dtype=base_dtype)
-                    t_tensor = t_curr.expand(bs).to(transformer_device, dtype=base_dtype)
+                    t_tensor = (t_curr * 1000).expand(bs).to(transformer_device, dtype=base_dtype)
+                    #t_tensor = t_curr.expand(bs).to(transformer_device, dtype=base_dtype)
 
                     model_inputs = (
                         latents_seq,
