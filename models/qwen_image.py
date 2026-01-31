@@ -899,9 +899,10 @@ class QwenImagePipeline(BasePipeline):
                 # QwenImage VAE decode expects (batch, channels, num_frame, height, width)
                 latents = latents_spatial
 
-                vae_device = next(self.vae.parameters()).device
+                decode_device = transformer_device
+                self.vae.to(decode_device)
                 vae_dtype = next(self.vae.parameters()).dtype
-                latents = latents.to(vae_device, dtype=vae_dtype)
+                latents = latents.to(decode_device, dtype=vae_dtype)
                 scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
                 if scaling_factor is not None:
                     latents = latents / scaling_factor
@@ -910,7 +911,12 @@ class QwenImagePipeline(BasePipeline):
                     image = image.squeeze(2)
 
                 image = (image / 2 + 0.5).clamp(0, 1)
-                image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+                if image.device.type == 'meta':
+                    raise RuntimeError(
+                        'VAE decode returned meta tensor; ensure the VAE is fully loaded and on a real device. '
+                        'If using init_empty_weights, load all VAE weights before sample generation.'
+                    )
+                image = image.to('cpu').permute(0, 2, 3, 1).float().numpy()
                 pil_image = Image.fromarray((image[0] * 255).astype("uint8"))
                 images.append(pil_image)
 
