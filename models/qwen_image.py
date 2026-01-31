@@ -823,96 +823,87 @@ class QwenImagePipeline(BasePipeline):
         self.transformer.eval()
         self.vae.eval()
         
-        # Get the actual device from the transformer's img_in layer
-        # This ensures we use the correct device even when block swapping is enabled
+        # Block swap is left as set by the caller (e.g. train.py prepare_block_swap_inference(disable_block_swap=...)).
+        # We use the layer-based forward (to_layers) so the offloader can move blocks to GPU just-in-time.
         transformer_device = next(self.transformer.img_in.parameters()).device
-        transformer_dtype = next(self.transformer.img_in.parameters()).dtype
-        
-        # Get the base dtype for time_text_embed (which is kept in high precision)
-        # time_text_embed outputs temb in base dtype (BFloat16), but img_mod might be quantized
-        # The transformer should handle dtype conversion internally, but we use base dtype for timestep
         base_dtype = self.model_config['dtype']
+        bs = 1
+        num_channels_latents = self.transformer.config.in_channels // 4
+        h, w = height // 8, width // 8
+        img_seq_len = (h // 2) * (w // 2)
 
         for prompt in prompts:
-            # --- 1. Handle Cached Embeddings ---
             if (hasattr(self, 'sample_prompt_embeds') and self.sample_prompt_embeds is not None and
                 hasattr(self, 'sample_prompts') and self.sample_prompts is not None):
                 if prompt in self.sample_prompts:
                     cached_idx = self.sample_prompts.index(prompt)
-                    # Force to device immediately upon retrieval - use transformer's device
-                    # Use base_dtype to match what time_text_embed expects
                     prompt_embeds = self.sample_prompt_embeds[cached_idx].to(transformer_device, dtype=base_dtype)
+                    if prompt_embeds.dim() == 2:
+                        prompt_embeds = prompt_embeds.unsqueeze(0)
                 else:
                     raise RuntimeError(f'Prompt "{prompt}" not found in cache.')
             else:
                 raise RuntimeError("No cached embeddings found. Call cache_sample_prompts() first.")
 
+            txt_len = prompt_embeds.shape[1]
             generator = torch.Generator(device=transformer_device).manual_seed(seed)
-            
-            with torch.no_grad():                
-                # --- 2. Prepare Latents ---
-                in_channels = self.transformer.config.in_channels
-                latents = torch.randn(
-                    (1, in_channels, height // 8, width // 8),
-                    generator=generator, 
-                    device=transformer_device, 
-                    dtype=base_dtype
+
+            with torch.no_grad():
+                # Initial noise in same format as training: (bs, c, num_frames, h, w) then pack
+                latents_spatial = torch.randn(
+                    (bs, num_channels_latents, 1, h, w),
+                    generator=generator,
+                    device=transformer_device,
+                    dtype=base_dtype,
                 )
+                latents_seq = self._pack_latents(latents_spatial, bs, num_channels_latents, h, w)
 
-                # --- 3. Prepare Sequence and Shapes ---
-                batch, channels, h, w = latents.shape
-                # Flatten and move to transformer's device
-                # Use base_dtype for hidden_states since time_text_embed is kept in high precision
-                # and needs to match the dtype expected by the transformer's internal layers
-                latents_seq = latents.view(batch, channels, -1).permute(0, 2, 1).to(transformer_device, dtype=base_dtype)
-                
-                # RoPE shapes: Qwen2-VL based models usually need (h, w, 1)
-                img_shapes = [(h, w, 1)]
+                img_shapes_list = [(1, h // 2, w // 2)]
+                img_shapes_tensor = torch.tensor([img_shapes_list], dtype=torch.int32, device=transformer_device).repeat((bs, 1, 1))
+                txt_seq_lens = torch.tensor([txt_len], dtype=torch.int32, device=transformer_device).repeat((bs,))
+                prompt_embeds_mask = torch.ones((bs, txt_len), dtype=torch.bool, device=transformer_device)
+                img_attention_mask = torch.ones((bs, img_seq_len), dtype=torch.bool, device=transformer_device)
+                attention_mask = torch.cat([prompt_embeds_mask, img_attention_mask], dim=1).view(bs, 1, 1, -1)
+                extra = ()
 
-                # --- 4. Flow Matching Loop ---
-                # timesteps 1.0 -> 0.0
                 timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=transformer_device, dtype=base_dtype)
+                layers = self.to_layers()
 
                 for i in tqdm(range(num_inference_steps), desc="Sampling"):
                     t_curr = timesteps[i]
                     t_next = timesteps[i + 1]
-                    
-                    # Qwen-Image FM usually expects 0-1000 float
-                    # Use base_dtype for timestep since time_text_embed is kept in high precision
-                    t_tensor = (t_curr * 1000).expand(batch).to(transformer_device, dtype=base_dtype)
+                    t_tensor = (t_curr * 1000).expand(bs).to(transformer_device, dtype=base_dtype)
 
-                    # Ensure hidden_states and encoder_hidden_states are in the correct dtype for the transformer
-                    # If the transformer is quantized (e.g. Float8), it will handle the conversion internally
-                    # but we should ensure we're not passing something that causes a mismatch in the first layer.
-                    # The InitialLayer has @torch.autocast which should handle this, but for generate_samples
-                    # we are calling self.transformer directly which might bypass some of our custom logic.
-                    
-                    with torch.autocast('cuda', dtype=AUTOCAST_DTYPE):
-                        # Ensure inputs are in the expected dtype for autocast if they aren't already
-                        model_output = self.transformer(
-                            hidden_states=latents_seq.to(dtype=AUTOCAST_DTYPE),
-                            encoder_hidden_states=prompt_embeds.to(dtype=AUTOCAST_DTYPE),
-                            timestep=t_tensor.to(dtype=AUTOCAST_DTYPE),
-                            img_shapes=img_shapes,
-                            return_dict=False
-                        )[0]
+                    model_inputs = (
+                        latents_seq,
+                        prompt_embeds,
+                        attention_mask,
+                        t_tensor,
+                        img_shapes_tensor,
+                        txt_seq_lens,
+                    ) + extra
 
-                    # Euler Step
+                    x = model_inputs
+                    for layer in layers:
+                        x = layer(x)
+                    model_output = x
+
                     dt = t_next - t_curr
-                    latents_seq = latents_seq + model_output * dt.to(model_output.dtype)
+                    dt = dt.to(model_output.dtype)
+                    if model_output.size(-1) != latents_seq.size(-1):
+                        model_output = model_output.repeat_interleave(latents_seq.size(-1) // model_output.size(-1), dim=-1)
+                    latents_seq = latents_seq + model_output * dt
 
-                # --- 5. Reconstruction ---
-                # Sequence back to Spatial
-                latents = latents_seq.permute(0, 2, 1).view(batch, channels, h, w)
+                latents_packed = latents_seq
+                latents_spatial = self._unpack_latents(latents_packed, bs, num_channels_latents, h, w)
+                latents = latents_spatial.squeeze(2)
 
-                # VAE Decode - ensure latents are on VAE's device
                 vae_device = next(self.vae.parameters()).device
                 vae_dtype = next(self.vae.parameters()).dtype
                 latents = latents.to(vae_device, dtype=vae_dtype)
                 latents = latents / self.vae.config.scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
-                
-                # Convert to PIL
+
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).float().numpy()
                 pil_image = Image.fromarray((image[0] * 255).astype("uint8"))
@@ -967,9 +958,10 @@ class InitialLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        for item in inputs:
-            if torch.is_floating_point(item):
-                item.requires_grad_(True)
+        if torch.is_grad_enabled():
+            for item in inputs:
+                if torch.is_floating_point(item):
+                    item.requires_grad_(True)
 
         hidden_states, encoder_hidden_states, attention_mask, timestep, img_shapes, txt_seq_lens, *extra = inputs
 
