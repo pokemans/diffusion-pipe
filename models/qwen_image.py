@@ -896,7 +896,8 @@ class QwenImagePipeline(BasePipeline):
 
                 latents_packed = latents_seq
                 latents_spatial = self._unpack_latents(latents_packed, bs, num_channels_latents, h, w)
-                latents = latents_spatial.squeeze(2)
+                # QwenImage VAE decode expects (batch, channels, num_frame, height, width)
+                latents = latents_spatial
 
                 vae_device = next(self.vae.parameters()).device
                 vae_dtype = next(self.vae.parameters()).dtype
@@ -905,6 +906,8 @@ class QwenImagePipeline(BasePipeline):
                 if scaling_factor is not None:
                     latents = latents / scaling_factor
                 image = self.vae.decode(latents, return_dict=False)[0]
+                if image.dim() == 5:
+                    image = image.squeeze(2)
 
                 image = (image / 2 + 0.5).clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).float().numpy()
