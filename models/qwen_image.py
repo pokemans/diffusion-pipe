@@ -932,15 +932,15 @@ class QwenImagePipeline(BasePipeline):
                 if scaling_factor is not None:
                 # Check if scaling_factor needs to be broadcast over the 'Time' dimension (dim 2)
                 if isinstance(scaling_factor, torch.Tensor):
-                     # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
-                     # Ensure it broadcasts correctly:
-                     scaling_factor = scaling_factor.to(latents.device)
-                     if scaling_factor.ndim < latents.ndim:
-                         # Add missing dimensions until it matches
-                         while scaling_factor.ndim < latents.ndim:
-                             scaling_factor = scaling_factor.unsqueeze(-1)
+                    # If factor is (1, 4, 1, 1), it might fail against (1, 4, 1, H, W) depending on exact shape
+                    # Ensure it broadcasts correctly:
+                    scaling_factor = scaling_factor.to(latents.device)
+                    if scaling_factor.ndim < latents.ndim:
+                        # Add missing dimensions until it matches
+                        while scaling_factor.ndim < latents.ndim:
+                            scaling_factor = scaling_factor.unsqueeze(-1)
     
-                    latents = latents / scaling_factor
+                latents = latents / scaling_factor
 
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
