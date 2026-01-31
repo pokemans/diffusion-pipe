@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 from typing import Union, Tuple, Optional
 import math
@@ -22,6 +23,8 @@ from utils.offloading import ModelOffloader
 
 
 KEEP_IN_HIGH_PRECISION = ['time_text_embed', 'img_in', 'txt_in', 'norm_out', 'proj_out']
+
+logger = logging.getLogger(__name__)
 
 
 def apply_rotary_emb_qwen(
@@ -788,6 +791,7 @@ class QwenImagePipeline(BasePipeline):
         t_expanded = t.view(-1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
+        logger.debug('prepare_inputs: target.shape=%s latents.shape=%s', target.shape, latents.shape)
 
         img_shapes = [(1, h // 2, w // 2)]
 
@@ -891,8 +895,17 @@ class QwenImagePipeline(BasePipeline):
 
                     dt = t_next - t_curr
                     dt = dt.to(model_output.dtype)
+                    if i == 0:
+                        model_output_before = model_output.shape
+                        expanded = model_output.size(-1) != latents_seq.size(-1)
+                        ratio = latents_seq.size(-1) // model_output.size(-1) if expanded else 1
                     if model_output.size(-1) != latents_seq.size(-1):
                         model_output = model_output.repeat_interleave(latents_seq.size(-1) // model_output.size(-1), dim=-1)
+                    if i == 0:
+                        logger.info(
+                            'generate_samples (first step): latents_seq=%s model_output_before=%s expanded=%s ratio=%s model_output_after=%s',
+                            latents_seq.shape, model_output_before, expanded, ratio, model_output.shape,
+                        )
                     latents_seq = latents_seq + model_output * dt
 
                 latents_packed = latents_seq
@@ -916,8 +929,6 @@ class QwenImagePipeline(BasePipeline):
                 scaling_factor = getattr(self.vae.config, 'scaling_factor', None)
                 if scaling_factor is not None:
                     latents = latents / scaling_factor
-                # Inverse of encoding normalization: flow evolves normalized latents; decoder expects raw.
-                latents = latents * self.vae.latents_std_tensor.to(latents.device) + self.vae.latents_mean_tensor.to(latents.device)
                 image = self.vae.decode(latents, return_dict=False)[0]
                 if image.dim() == 5:
                     image = image.squeeze(2)
@@ -1057,4 +1068,5 @@ class FinalLayer(nn.Module):
             assert len(extra) == 1
             img_seq_len = extra[0][0].item()
             output = output[:, :img_seq_len, ...]
+        logger.debug('FinalLayer.forward: output.shape=%s', output.shape)
         return output
